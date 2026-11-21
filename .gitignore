@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.gradio/
+data/
+eval/results/
+*.sqlite
+*.db
+models/*
+!models/.gitkeep

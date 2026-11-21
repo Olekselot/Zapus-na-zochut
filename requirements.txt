@@ -1,0 +1,9 @@
+numpy>=1.26
+opencv-python>=4.8
+Pillow>=10
+insightface>=0.7.3
+onnxruntime>=1.17
+torch>=2.2
+topologies>=0.0.17
+gradio>=4.44
+scikit-learn>=1.3
