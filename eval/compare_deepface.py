@@ -1,4 +1,9 @@
-"""Порівняння Facenet512, VGG-Face і ArcFace з deepface на тих самих парах LFW."""
+"""Порівняння ArcFace (insightface, як у демо) з Facenet512, VGG-Face і ArcFace з deepface.
+
+Чесні умови: усі моделі бачать одне й те саме вирівняне обличчя від нашого детектора,
+а різниться лише модель розпізнавання. Протокол той самий — 10 фолдів LFW з порогом
+з інших фолдів. deepface приймає масив як BGR, тому кропи передаються саме так.
+"""
 
 from __future__ import annotations
 
@@ -13,86 +18,81 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from eval.lfw import load_test_pairs, to_uint8_rgb  # noqa: E402
+from eval.lfw import embed_paths, lfw_home, load_pairs, pair_scores  # noqa: E402
 from src.config import RESULTS_DIR  # noqa: E402
-from src.metrics import equal_error_point, operating_point, recognition_curve  # noqa: E402
+from src.metrics import cross_validate, equal_error_point, recognition_curve  # noqa: E402
 
 MODELS = ("Facenet512", "VGG-Face", "ArcFace")
 
 
-def cosine(left: np.ndarray, right: np.ndarray) -> float:
-    left = np.asarray(left, dtype=np.float32).reshape(-1)
-    right = np.asarray(right, dtype=np.float32).reshape(-1)
-    left = left / max(float(np.linalg.norm(left)), 1e-12)
-    right = right / max(float(np.linalg.norm(right)), 1e-12)
-    return float(np.dot(left, right))
+def aligned_crops(paths: list[Path], det_size: int) -> dict[str, np.ndarray | None]:
+    from src.faces import FaceEngine
+    from src.images import imread
+
+    engine = FaceEngine(det_size=det_size, with_landmarks=False)
+    crops = {}
+    for index, path in enumerate(paths, start=1):
+        found = engine.analyze(imread(path), pick="center")
+        crops[str(path)] = None if found is None else found.aligned_bgr
+        if index % 500 == 0:
+            print(f"Кропів {index}/{len(paths)}", flush=True)
+    return crops
 
 
-def represent(image: np.ndarray, model_name: str) -> np.ndarray | None:
+def deepface_vectors(crops: dict[str, np.ndarray | None], model_name: str) -> dict[str, np.ndarray]:
     from deepface import DeepFace
 
-    rgb = to_uint8_rgb(image)
-    try:
-        rows = DeepFace.represent(
-            img_path=rgb,
-            model_name=model_name,
-            enforce_detection=False,
-            detector_backend="skip",
-            align=False,
-        )
-    except Exception:
-        rows = DeepFace.represent(
-            img_path=rgb,
-            model_name=model_name,
-            enforce_detection=False,
-            detector_backend="opencv",
-        )
-    if not rows:
-        return None
-    return np.asarray(rows[0]["embedding"], dtype=np.float32)
-
-
-def evaluate_model(model_name: str, pairs: np.ndarray, genuine: np.ndarray) -> dict:
-    scores = []
-    labels = []
-    missed = 0
-    for left, right, same in zip(pairs[:, 0], pairs[:, 1], genuine):
-        first = represent(left, model_name)
-        second = represent(right, model_name)
-        if first is None or second is None:
-            missed += 1
+    vectors = {}
+    for key, crop in crops.items():
+        if crop is None:
+            vectors[key] = np.full(1, np.nan, dtype=np.float32)
             continue
-        scores.append(cosine(first, second))
-        labels.append(bool(same))
-    if not scores or not any(labels) or all(labels):
-        return {"model": model_name, "error": "замало пар", "missed": missed}
-    points = recognition_curve(np.asarray(scores), np.asarray(labels))
-    eer = equal_error_point(points)
-    far1 = operating_point(points, 0.01)
+        rows = DeepFace.represent(
+            img_path=crop, model_name=model_name, detector_backend="skip", enforce_detection=False, align=False
+        )
+        vector = np.asarray(rows[0]["embedding"], dtype=np.float32)
+        vectors[key] = vector / max(float(np.linalg.norm(vector)), 1e-12)
+    return vectors
+
+
+def summarize(name: str, scores: np.ndarray, labels: np.ndarray, folds: np.ndarray) -> dict:
+    points = recognition_curve(scores, labels)
+    cv = cross_validate(scores, labels, folds, 0.01)
     return {
-        "model": model_name,
-        "pairs": len(scores),
-        "missed": missed,
-        "eer": eer.far,
-        "eer_threshold": eer.threshold,
-        "tar_at_far_1": None if far1 is None else far1.tar,
-        "frr_at_far_1": None if far1 is None else far1.frr,
-        "threshold_at_far_1": None if far1 is None else far1.threshold,
+        "model": name,
+        "pairs": int(len(scores)),
+        "fta_pairs": int(np.isnan(scores).sum()),
+        "accuracy": cv["accuracy"],
+        "eer": equal_error_point(points).far,
+        "tar_at_far_1": cv["tar"],
+        "far_at_far_1": cv["far"],
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Порівняти моделі deepface на LFW")
-    parser.add_argument("--max-pairs", type=int, default=None)
-    parser.add_argument("--resize", type=float, default=1.0)
+    parser = argparse.ArgumentParser(description="Порівняти моделі розпізнавання на LFW")
+    parser.add_argument("--per-fold", type=int, default=None, help="Пар з кожного фолду для швидкого прогону")
+    parser.add_argument("--det-size", type=int, default=640)
     args = parser.parse_args()
-    pairs, genuine = load_test_pairs(max_pairs=args.max_pairs, resize=args.resize)
-    reports = []
+    home = lfw_home()
+    pairs = load_pairs(home, args.per_fold)
+    labels = np.asarray([same for _a, _b, same, _f in pairs])
+    folds = np.asarray([fold for _a, _b, _s, fold in pairs])
+    paths = sorted({path for first, second, _s, _f in pairs for path in (first, second)})
+
+    ours = embed_paths(paths, det_size=args.det_size)
+    reports = [summarize("insightface ArcFace (демо)", pair_scores(pairs, ours), labels, folds)]
+    print(reports[-1], flush=True)
+    crops = aligned_crops(paths, args.det_size)
     for model_name in MODELS:
         print(f"Модель {model_name}...", flush=True)
-        report = evaluate_model(model_name, pairs, genuine)
-        reports.append(report)
-        print(report)
+        vectors = deepface_vectors(crops, model_name)
+        scores = []
+        for first, second, _same, _fold in pairs:
+            left, right = vectors[str(first)], vectors[str(second)]
+            scores.append(float(np.dot(left, right)) if left.size > 1 and right.size > 1 else np.nan)
+        reports.append(summarize(f"deepface {model_name}", np.asarray(scores), labels, folds))
+        print(reports[-1], flush=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     destination = RESULTS_DIR / "deepface_lfw.json"
     destination.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
