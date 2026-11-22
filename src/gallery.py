@@ -1,4 +1,4 @@
-"""Пошук клієнта за косинусною схожістю векторів обличчя."""
+"""Пошук клієнта: косинус до шаблону клієнта і відрив від другого кандидата."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ class Match:
     code: str | None
     similarity: float | None
     accepted: bool
+    second_similarity: float | None = None
+    reason: str | None = None
 
 
 def l2_normalize(vector: np.ndarray) -> np.ndarray:
@@ -33,31 +35,58 @@ def cosine(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.dot(l2_normalize(left), l2_normalize(right)))
 
 
-def best_match(query: np.ndarray, entries: list[tuple[int, str, np.ndarray]], threshold: float) -> Match:
-    """Оцінка клієнта — максимальний косинус серед усіх його збережених векторів.
+def template(vectors: list[np.ndarray]) -> np.ndarray:
+    """Шаблон клієнта — нормований середній вектор усіх його фото."""
+    if not vectors:
+        raise ValueError("немає векторів для шаблону")
+    stacked = np.stack([l2_normalize(vector) for vector in vectors], axis=0)
+    return l2_normalize(stacked.mean(axis=0))
 
-    Приймаємо збіг, якщо ця оцінка не нижча за поріг. Поріг підбирається так,
-    щоб чужих пропускало мало (орієнтир FAR 1% на LFW).
-    """
-    if not entries:
-        return Match(None, None, None, False)
 
-    query_vector = l2_normalize(query)
+def client_templates(entries: list[tuple[int, str, np.ndarray]]) -> list[tuple[int, str, np.ndarray]]:
     grouped: dict[tuple[int, str], list[np.ndarray]] = {}
     for client_id, code, vector in entries:
         grouped.setdefault((client_id, code), []).append(vector)
+    return [(client_id, code, template(vectors)) for (client_id, code), vectors in grouped.items()]
 
-    best_id: int | None = None
-    best_code: str | None = None
-    best_score = -2.0
-    for (client_id, code), vectors in grouped.items():
-        score = max(float(np.dot(query_vector, l2_normalize(vector))) for vector in vectors)
-        if score > best_score or (score == best_score and (best_id is None or client_id < best_id)):
-            best_score = score
-            best_id = client_id
-            best_code = code
 
-    accepted = best_score >= threshold
-    if not accepted:
-        return Match(None, None, best_score, False)
-    return Match(best_id, best_code, best_score, True)
+def best_match(
+    query: np.ndarray,
+    entries: list[tuple[int, str, np.ndarray]],
+    threshold: float,
+    margin: float = 0.0,
+) -> Match:
+    """Оцінка клієнта — косинус до його шаблону, а не максимум по всіх фото.
+
+    Максимум по багатьох фото дає чужому більше шансів випадково пройти поріг,
+    підібраний на парах «фото проти фото». Шаблон цього не робить.
+    Збіг приймаємо, якщо оцінка не нижча за поріг і найкращий клієнт
+    відривається від другого хоча б на margin.
+    """
+    if not entries:
+        return Match(None, None, None, False, reason="empty")
+    query_vector = l2_normalize(query)
+    scored = sorted(
+        ((float(np.dot(query_vector, vector)), client_id, code) for client_id, code, vector in client_templates(entries)),
+        key=lambda item: (-item[0], item[1]),
+    )
+    best_score, best_id, best_code = scored[0]
+    second = scored[1][0] if len(scored) > 1 else None
+    if best_score < threshold:
+        return Match(None, None, best_score, False, second, "below_threshold")
+    if second is not None and best_score - second < margin:
+        return Match(None, None, best_score, False, second, "ambiguous")
+    return Match(best_id, best_code, best_score, True, second, None)
+
+
+def consistent(vectors: list[np.ndarray], threshold: float) -> tuple[list[int], np.ndarray]:
+    """Індекси векторів, що схожі на медоїд групи не менше за threshold, і шаблон із них.
+
+    Медоїд — вектор, найближчий у середньому до всіх інших. Так одне чуже фото
+    не тягне шаблон у свій бік.
+    """
+    normalized = np.stack([l2_normalize(vector) for vector in vectors], axis=0)
+    similarity = normalized @ normalized.T
+    medoid = int(np.argmax(similarity.sum(axis=1)))
+    keep = [index for index in range(len(vectors)) if similarity[medoid, index] >= threshold]
+    return keep, template([normalized[index] for index in keep])

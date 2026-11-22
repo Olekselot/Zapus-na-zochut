@@ -1,21 +1,71 @@
-"""Локальний банк. У SQLite лежать коди клієнтів, вектори, баланс і журнал, без фото."""
+"""Локальний банк. У SQLite лежать клієнти, вектори, баланс у копійках і журнал, без фото."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import re
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import numpy as np
 
-from src.config import DB_PATH, EMBEDDING_DIM, ensure_runtime_dirs
+from src.config import DB_PATH, EMBEDDING_DIM, PIN_MAX_FAILURES, ensure_runtime_dirs
 from src.gallery import l2_normalize
+
+PIN_PATTERN = re.compile(r"^\d{4,6}$")
+PIN_ITERATIONS = 200_000
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    first_name TEXT NOT NULL DEFAULT '',
+    last_name TEXT NOT NULL DEFAULT '',
+    pin_hash TEXT NOT NULL DEFAULT '',
+    pin_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    id INTEGER PRIMARY KEY,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    vector BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_client ON embeddings(client_id);
+CREATE TABLE IF NOT EXISTS accounts (
+    client_id INTEGER PRIMARY KEY REFERENCES clients(id),
+    balance_kop INTEGER NOT NULL CHECK (balance_kop >= 0)
+);
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY,
+    client_id INTEGER REFERENCES clients(id),
+    amount_kop INTEGER,
+    similarity REAL,
+    antispoof_score REAL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
 
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def to_kop(value: float | int | str) -> int:
+    """Гривні в цілі копійки без похибок float: 0.1 + 0.2 грн дає рівно 30 коп."""
+    return int((Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def from_kop(value: int) -> float:
+    return int(value) / 100
 
 
 def normalize_name(value: str) -> str:
@@ -42,67 +92,100 @@ def decode_vector(blob: bytes) -> np.ndarray:
     return values
 
 
+def valid_pin(pin: str) -> bool:
+    return bool(PIN_PATTERN.match(pin or ""))
+
+
+def hash_pin(pin: str) -> str:
+    if not valid_pin(pin):
+        raise ValueError("PIN має містити 4–6 цифр.")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, PIN_ITERATIONS)
+    return f"pbkdf2_sha256${PIN_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def check_pin(pin: str, stored: str) -> bool:
+    try:
+        _scheme, iterations, salt, expected = stored.split("$")
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", (pin or "").encode("utf-8"), bytes.fromhex(salt), int(iterations))
+    return hmac.compare_digest(digest.hex(), expected)
+
+
 class Bank:
     def __init__(self, path: Path | None = None) -> None:
         ensure_runtime_dirs()
         self.path = Path(path) if path is not None else DB_PATH
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                PRAGMA foreign_keys = ON;
-                CREATE TABLE IF NOT EXISTS clients (
-                    id INTEGER PRIMARY KEY,
-                    code TEXT NOT NULL UNIQUE,
-                    first_name TEXT NOT NULL DEFAULT '',
-                    last_name TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    id INTEGER PRIMARY KEY,
-                    client_id INTEGER NOT NULL REFERENCES clients(id),
-                    vector BLOB NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS accounts (
-                    client_id INTEGER PRIMARY KEY REFERENCES clients(id),
-                    balance REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY,
-                    client_id INTEGER REFERENCES clients(id),
-                    amount REAL,
-                    similarity REAL,
-                    antispoof_score REAL,
-                    status TEXT NOT NULL,
-                    detail TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
-            self._ensure_name_columns(connection)
+        with self._lock, self._connect() as connection:
+            self._migrate_before(connection)
+            connection.executescript(SCHEMA)
+            self._migrate_after(connection)
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
         finally:
             connection.close()
 
+    @contextmanager
+    def _write(self):
+        """Одна транзакція з блокуванням запису: перевірка балансу і списання не розірвуться."""
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     @staticmethod
-    def _ensure_name_columns(connection: sqlite3.Connection) -> None:
-        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(clients)")}
-        if "first_name" not in columns:
-            connection.execute("ALTER TABLE clients ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
-        if "last_name" not in columns:
-            connection.execute("ALTER TABLE clients ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate_before(self, connection: sqlite3.Connection) -> None:
+        """Стара таблиця рахунків з балансом REAL перебудовується в копійки."""
+        columns = self._columns(connection, "accounts")
+        if columns and "balance_kop" not in columns and "balance" in columns:
+            connection.executescript(
+                """
+                BEGIN;
+                CREATE TABLE accounts_kop (
+                    client_id INTEGER PRIMARY KEY REFERENCES clients(id),
+                    balance_kop INTEGER NOT NULL CHECK (balance_kop >= 0)
+                );
+                INSERT INTO accounts_kop(client_id, balance_kop)
+                    SELECT client_id, CAST(ROUND(balance * 100) AS INTEGER) FROM accounts;
+                DROP TABLE accounts;
+                ALTER TABLE accounts_kop RENAME TO accounts;
+                COMMIT;
+                """
+            )
+
+    def _migrate_after(self, connection: sqlite3.Connection) -> None:
+        clients = self._columns(connection, "clients")
+        for name, ddl in (
+            ("first_name", "TEXT NOT NULL DEFAULT ''"),
+            ("last_name", "TEXT NOT NULL DEFAULT ''"),
+            ("pin_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("pin_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in clients:
+                connection.execute(f"ALTER TABLE clients ADD COLUMN {name} {ddl}")
+        transactions = self._columns(connection, "transactions")
+        if "amount_kop" not in transactions:
+            connection.execute("ALTER TABLE transactions ADD COLUMN amount_kop INTEGER")
+            if "amount" in transactions:
+                connection.execute(
+                    "UPDATE transactions SET amount_kop = CAST(ROUND(amount * 100) AS INTEGER) WHERE amount IS NOT NULL"
+                )
 
     @staticmethod
     def _next_code(connection: sqlite3.Connection) -> str:
@@ -111,6 +194,31 @@ class Bank:
         while f"c{number}" in used:
             number += 1
         return f"c{number}"
+
+    @staticmethod
+    def _insert_client(
+        connection: sqlite3.Connection,
+        code: str,
+        first_name: str,
+        last_name: str,
+        stored: list[bytes],
+        balance: float,
+        pin_hash: str,
+    ) -> int:
+        balance_kop = to_kop(balance)
+        if balance_kop < 0:
+            raise ValueError("баланс не може бути від’ємним")
+        cursor = connection.execute(
+            "INSERT INTO clients(code, first_name, last_name, pin_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            (code, first_name.strip(), last_name.strip(), pin_hash, _now()),
+        )
+        client_id = int(cursor.lastrowid)
+        connection.executemany(
+            "INSERT INTO embeddings(client_id, vector) VALUES (?, ?)",
+            [(client_id, blob) for blob in stored],
+        )
+        connection.execute("INSERT INTO accounts(client_id, balance_kop) VALUES (?, ?)", (client_id, balance_kop))
+        return client_id
 
     def enroll(
         self,
@@ -123,24 +231,11 @@ class Bank:
         if not embeddings:
             raise ValueError("потрібен хоча б один вектор обличчя")
         stored = [encode_vector(vector) for vector in embeddings]
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             try:
-                cursor = connection.execute(
-                    "INSERT INTO clients(code, first_name, last_name, created_at) VALUES (?, ?, ?, ?)",
-                    (code, first_name.strip(), last_name.strip(), _now()),
-                )
+                return self._insert_client(connection, code, first_name, last_name, stored, balance, "")
             except sqlite3.IntegrityError as error:
                 raise ValueError(f"клієнт {code} уже є в базі") from error
-            client_id = int(cursor.lastrowid)
-            connection.executemany(
-                "INSERT INTO embeddings(client_id, vector) VALUES (?, ?)",
-                [(client_id, blob) for blob in stored],
-            )
-            connection.execute(
-                "INSERT INTO accounts(client_id, balance) VALUES (?, ?)",
-                (client_id, round(float(balance), 2)),
-            )
-            return client_id
 
     def register_person(
         self,
@@ -148,26 +243,18 @@ class Bank:
         last_name: str,
         embeddings: list[np.ndarray],
         balance: float,
+        pin: str | None = None,
+        pin_hash: str | None = None,
     ) -> tuple[int, str]:
         """Новий клієнт отримує внутрішній код cN. Назовні повертається «Прізвище Ім’я»."""
         if not embeddings:
             raise ValueError("потрібен хоча б один вектор обличчя")
         stored = [encode_vector(vector) for vector in embeddings]
-        with self._lock, self._connect() as connection:
+        if pin_hash is None:
+            pin_hash = hash_pin(pin) if pin else ""
+        with self._write() as connection:
             code = self._next_code(connection)
-            cursor = connection.execute(
-                "INSERT INTO clients(code, first_name, last_name, created_at) VALUES (?, ?, ?, ?)",
-                (code, first_name.strip(), last_name.strip(), _now()),
-            )
-            client_id = int(cursor.lastrowid)
-            connection.executemany(
-                "INSERT INTO embeddings(client_id, vector) VALUES (?, ?)",
-                [(client_id, blob) for blob in stored],
-            )
-            connection.execute(
-                "INSERT INTO accounts(client_id, balance) VALUES (?, ?)",
-                (client_id, round(float(balance), 2)),
-            )
+            client_id = self._insert_client(connection, code, first_name, last_name, stored, balance, pin_hash)
             return client_id, display_name(first_name, last_name, code)
 
     def add_embeddings(self, client_id: int, embeddings: list[np.ndarray]) -> int:
@@ -175,7 +262,7 @@ class Bank:
         if not embeddings:
             raise ValueError("потрібен хоча б один вектор обличчя")
         stored = [encode_vector(vector) for vector in embeddings]
-        with self._lock, self._connect() as connection:
+        with self._write() as connection:
             row = connection.execute("SELECT id FROM clients WHERE id = ?", (int(client_id),)).fetchone()
             if row is None:
                 raise KeyError(client_id)
@@ -189,9 +276,7 @@ class Bank:
         target_first = normalize_name(first_name)
         target_last = normalize_name(last_name)
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                "SELECT id, code, first_name, last_name FROM clients ORDER BY id"
-            ).fetchall()
+            rows = connection.execute("SELECT id, code, first_name, last_name FROM clients ORDER BY id").fetchall()
         found: list[dict[str, object]] = []
         for row in rows:
             if normalize_name(str(row["first_name"])) != target_first:
@@ -225,21 +310,46 @@ class Bank:
             for row in rows
         ]
 
+    def client_vectors(self, client_id: int) -> list[np.ndarray]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT vector FROM embeddings WHERE client_id = ? ORDER BY id", (int(client_id),)
+            ).fetchall()
+        return [decode_vector(row["vector"]) for row in rows]
+
     def balance_of(self, client_id: int) -> float:
         with self._lock, self._connect() as connection:
-            row = connection.execute(
-                "SELECT balance FROM accounts WHERE client_id = ?",
-                (client_id,),
-            ).fetchone()
+            row = connection.execute("SELECT balance_kop FROM accounts WHERE client_id = ?", (client_id,)).fetchone()
         if row is None:
             raise KeyError(client_id)
-        return float(row["balance"])
+        return from_kop(row["balance_kop"])
+
+    def has_pin(self, client_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT pin_hash FROM clients WHERE id = ?", (int(client_id),)).fetchone()
+        return bool(row and row["pin_hash"])
+
+    def verify_pin(self, client_id: int, pin: str) -> str:
+        """ok, wrong, locked або none. Після PIN_MAX_FAILURES помилок поспіль PIN блокується."""
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT pin_hash, pin_failures FROM clients WHERE id = ?", (int(client_id),)
+            ).fetchone()
+            if row is None or not row["pin_hash"]:
+                return "none"
+            if int(row["pin_failures"]) >= PIN_MAX_FAILURES:
+                return "locked"
+            if check_pin(pin, str(row["pin_hash"])):
+                connection.execute("UPDATE clients SET pin_failures = 0 WHERE id = ?", (int(client_id),))
+                return "ok"
+            connection.execute("UPDATE clients SET pin_failures = pin_failures + 1 WHERE id = ?", (int(client_id),))
+            return "locked" if int(row["pin_failures"]) + 1 >= PIN_MAX_FAILURES else "wrong"
 
     def accounts(self) -> list[dict[str, object]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.code, c.first_name, c.last_name, a.balance, c.created_at,
+                SELECT c.code, c.first_name, c.last_name, c.pin_hash, a.balance_kop, c.created_at,
                        (SELECT COUNT(*) FROM embeddings e WHERE e.client_id = c.id) AS vectors
                 FROM clients c
                 JOIN accounts a ON a.client_id = c.id
@@ -249,8 +359,9 @@ class Bank:
         return [
             {
                 "клієнт": display_name(str(row["first_name"]), str(row["last_name"]), str(row["code"])),
-                "баланс": round(float(row["balance"]), 2),
+                "баланс": from_kop(row["balance_kop"]),
                 "векторів": int(row["vectors"]),
+                "PIN": "так" if row["pin_hash"] else "ні",
                 "зареєстровано": row["created_at"],
             }
             for row in rows
@@ -268,46 +379,36 @@ class Bank:
     ) -> tuple[str, float | None]:
         """Записати операцію. Гроші змінюються лише коли debit=True і на рахунку вистачає суми.
 
-        Повертає фактичний статус і баланс після спроби. Для відмов без клієнта баланс порожній.
+        Списання — один UPDATE з умовою balance_kop >= суми всередині BEGIN IMMEDIATE,
+        тож дві одночасні оплати не зійдуть у мінус. Повертає фактичний статус і баланс.
         """
-        with self._lock, self._connect() as connection:
+        amount_kop = None if amount is None else to_kop(amount)
+        with self._write() as connection:
             new_balance: float | None = None
             stored_status = status
             if debit:
-                if client_id is None or amount is None:
+                if client_id is None or amount_kop is None:
                     raise ValueError("списання потребує клієнта і суми")
+                if amount_kop <= 0:
+                    raise ValueError("сума списання має бути більшою за нуль")
+                cursor = connection.execute(
+                    "UPDATE accounts SET balance_kop = balance_kop - ? WHERE client_id = ? AND balance_kop >= ?",
+                    (amount_kop, client_id, amount_kop),
+                )
                 row = connection.execute(
-                    "SELECT balance FROM accounts WHERE client_id = ?",
-                    (client_id,),
+                    "SELECT balance_kop FROM accounts WHERE client_id = ?", (client_id,)
                 ).fetchone()
                 if row is None:
                     raise KeyError(client_id)
-                current = float(row["balance"])
-                if current + 1e-9 < float(amount):
-                    stored_status = "insufficient"
-                    new_balance = current
-                else:
-                    new_balance = round(current - float(amount), 2)
-                    connection.execute(
-                        "UPDATE accounts SET balance = ? WHERE client_id = ?",
-                        (new_balance, client_id),
-                    )
-                    stored_status = "paid"
+                stored_status = "paid" if cursor.rowcount == 1 else "insufficient"
+                new_balance = from_kop(row["balance_kop"])
             connection.execute(
                 """
                 INSERT INTO transactions(
-                    client_id, amount, similarity, antispoof_score, status, detail, created_at
+                    client_id, amount_kop, similarity, antispoof_score, status, detail, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    client_id,
-                    None if amount is None else round(float(amount), 2),
-                    similarity,
-                    antispoof_score,
-                    stored_status,
-                    detail,
-                    _now(),
-                ),
+                (client_id, amount_kop, similarity, antispoof_score, stored_status, detail, _now()),
             )
             return stored_status, new_balance
 
@@ -316,7 +417,7 @@ class Bank:
             rows = connection.execute(
                 """
                 SELECT t.created_at, t.status, c.code, c.first_name, c.last_name,
-                       t.amount, t.similarity, t.antispoof_score, t.detail
+                       t.amount_kop, t.similarity, t.antispoof_score, t.detail
                 FROM transactions t
                 LEFT JOIN clients c ON c.id = t.client_id
                 ORDER BY t.id DESC
@@ -331,7 +432,7 @@ class Bank:
                 "клієнт": ""
                 if row["code"] is None
                 else display_name(str(row["first_name"] or ""), str(row["last_name"] or ""), str(row["code"])),
-                "сума": None if row["amount"] is None else round(float(row["amount"]), 2),
+                "сума": None if row["amount_kop"] is None else from_kop(row["amount_kop"]),
                 "схожість": None if row["similarity"] is None else round(float(row["similarity"]), 3),
                 "живість": None if row["antispoof_score"] is None else round(float(row["antispoof_score"]), 3),
                 "деталі": row["detail"],
