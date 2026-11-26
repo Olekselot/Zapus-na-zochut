@@ -74,7 +74,6 @@ sympy==1.14.0
 threadpoolctl==3.8.0
 tifffile==2026.11.16
 tomlkit==0.14.0
-topologies==0.0.17
 torch==2.12.1
 torchvision==0.27.1
 tqdm==4.70.1

@@ -25,6 +25,7 @@ pip install -r requirements.txt
 Якщо `pip` починає компілювати insightface і падає з помилкою про C++, встановіть Microsoft C++ Build Tools (пункт «Desktop development with C++») і повторіть команду. Точні версії, на яких усе перевірено, лежать у `requirements-lock.txt`.
 
 Перший запуск сам завантажить ваги `buffalo_l` (RetinaFace і ArcFace, ~280 МБ) у `~/.insightface`. Ліцензія цих ваг некомерційна, у звіті це треба згадати. Для порівняння з deepface ставиться `requirements-eval.txt` (тягне TensorFlow), для підготовки CelebA-Spoof — `requirements-data.txt`.
+Пакет Topologies не потрібен для застосунку чи рекомендованого навчання. Архітектура `mnv2_scratch` — це MobileNetV2 з torchvision без ваг ImageNet; `topologies_mnv2` залишено для сумісності зі старими вагами.
 
 Тести, без камери й без нейромереж:
 
@@ -85,10 +86,12 @@ ArcFace не навчаємо. Навчається захист від підр
 
 ```text
 python training/train_antispoof.py --smoke                                   # перевірка циклу на CPU
-python training/train_antispoof.py --data data/celeba_spoof --balance        # основне навчання
+python training/train_antispoof.py --data data/celeba_spoof --balance --test-ratio 0 --epochs 8 --patience 3 --run-name imagenet
+python eval/antispoof_metrics.py --data data/celeba_spoof_test --split all   # зовнішній test-набір
+python training/train_antispoof.py --data data/celeba_spoof --balance --test-ratio 0 --arch mnv2_scratch --run-name scratch --weights models/antispoof_scratch.pt --meta models/antispoof_scratch_meta.json
+python eval/antispoof_metrics.py --data data/celeba_spoof_test --split all --weights models/antispoof_scratch.pt --meta models/antispoof_scratch_meta.json
 python training/train_antispoof.py --data data/celeba_spoof data/custom --balance
 python training/train_antispoof.py --data data/custom --folds 5 --balance    # крос-валідація за людьми
-python training/train_antispoof.py --data data/custom --arch topologies_mnv2 --run-name scratch   # з нуля, для порівняння
 ```
 
 - Модель за замовчуванням — MobileNetV3-Small з вагами ImageNet. Першу епоху вчиться лише голова, потім уся мережа: AdamW, косинусний розклад, згладжування міток.
@@ -96,9 +99,11 @@ python training/train_antispoof.py --data data/custom --arch topologies_mnv2 --r
 - Аугментації: світло, колір, гамма, масштаб, поворот, JPEG. Сильного розмиття немає, бо воно стирає муар екрана.
 - Зберігається найкраща епоха за validation, є рання зупинка.
 - Поріг P(live) підбирається на validation так, щоб найгірший APCER серед типів атак був не вищий за 5 %. Ймовірності калібруються температурою.
-- Метрики на test (люди, яких навчання не бачило) пишуться в `models/antispoof_meta.json`, криві навчання — в `eval/results/`.
+- Метрики на test (люди, яких навчання не бачило) пишуться в метадані моделі, криві навчання — в `eval/results/`. Для порівняння моделей `eval/antispoof_metrics.py` приймає `--weights` і `--meta`; кожен прогін отримує окремий JSON-звіт.
 - Підробки з CelebA-Spoof без типу (`spoof/`) вчаться як «друк або екран»: штраф −log(P(друк) + P(екран)).
+- Метадані фіксують архітектуру, факт використання ImageNet, найкращу епоху й час навчання для чесного порівняння прогонів.
 - Без відеокарти навчання йде на CPU повільно. Для повного навчання є `notebooks/train_antispoof_colab.ipynb`.
+- Затримку моделі можна виміряти штучним warm-start через `python eval/latency_benchmark.py --rounds 50 --batch-size 5`.
 
 ## Метрики
 

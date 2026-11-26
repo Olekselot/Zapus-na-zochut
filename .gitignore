@@ -11,3 +11,6 @@ eval/results/
 *.db
 models/*
 !models/.gitkeep
+!models/antispoof.pt
+!models/antispoof_meta.json
+!models/recognition_threshold.json

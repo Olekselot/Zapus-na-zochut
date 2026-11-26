@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
+from src.antispoof import ARCHES  # noqa: E402
 from src.config import (  # noqa: E402
     ANTISPOOF_META,
     ANTISPOOF_WEIGHTS,
@@ -145,7 +146,6 @@ def _loader(dataset: CropDataset, batch_size: int, shuffle: bool, balance: bool,
         shuffle=shuffle,
         sampler=sampler,
         num_workers=workers,
-        persistent_workers=workers > 0,
         generator=torch.Generator().manual_seed(seed),
     )
 
@@ -208,10 +208,11 @@ def train_one(args: argparse.Namespace, train_items, val_items, run_name: str) -
 
     from src.antispoof import build_model
 
+    training_started = time.monotonic()
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    pretrained = args.pretrained and args.arch != "topologies_mnv2"
+    pretrained = args.pretrained and args.arch in {"mnv3_small", "mnv3_large"}
     model, head = build_model(args.arch, len(CLASS_NAMES), args.width, pretrained=pretrained)
     model.to(device)
     train_ds = CropDataset(train_items, args.image_size, augment=True, seed=args.seed)
@@ -281,7 +282,13 @@ def train_one(args: argparse.Namespace, train_items, val_items, run_name: str) -
     if best_state is not None:
         model.load_state_dict(best_state)
     model.to("cpu")
-    return {"model": model, "history": history, "best_epoch": best["epoch"], "device": device}
+    return {
+        "model": model,
+        "history": history,
+        "best_epoch": best["epoch"],
+        "device": device,
+        "training_seconds": round(time.monotonic() - training_started, 1),
+    }
 
 
 def calibrate(args, model, val_items) -> tuple[float, float, str]:
@@ -374,10 +381,19 @@ def run_folds(args, items) -> None:
         train_items = [item for item in items if item[2] not in test_people | val_people]
         val_items = [item for item in items if item[2] in val_people]
         test_items = [item for item in items if item[2] in test_people]
+        _require_live_and_attack(train_items, "train")
+        _require_live_and_attack(val_items, "validation")
+        _require_live_and_attack(test_items, "test")
         result = train_one(args, train_items, val_items, f"fold {index + 1}/{args.folds}")
         temperature, threshold, _source = calibrate(args, result["model"], val_items)
         report = evaluate(args, result["model"], test_items, temperature, threshold)
-        report.update(fold=index + 1, threshold=threshold, test_people=sorted(test_people))
+        report.update(
+            fold=index + 1,
+            threshold=threshold,
+            test_people=sorted(test_people),
+            best_epoch=result["best_epoch"],
+            training_seconds=result["training_seconds"],
+        )
         reports.append(report)
         print(f"Fold {index + 1}: APCER {report['apcer']:.3f}, BPCER {report['bpcer']:.3f}", flush=True)
 
@@ -399,9 +415,36 @@ def _plain(args) -> dict:
     return {key: str(value) if isinstance(value, Path) else ([str(item) for item in value] if isinstance(value, list) else value) for key, value in vars(args).items()}
 
 
+def _require_live_and_attack(items, split_name: str) -> None:
+    labels = {label for _path, label, _person in items}
+    if 0 not in labels or not any(label != 0 for label in labels):
+        raise SystemExit(f"Частина {split_name} має містити і live, і хоча б один клас атаки.")
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.epochs < 1 or args.batch_size < 1 or args.patience < 1:
+        raise SystemExit("--epochs, --batch-size і --patience мають бути більшими за нуль.")
+    if args.workers < 0 or args.freeze_epochs < 0:
+        raise SystemExit("--workers і --freeze-epochs не можуть бути від’ємними.")
+    numeric = (args.width, args.crop_scale, args.lr, args.weight_decay, args.val_ratio, args.test_ratio, args.apcer, args.label_smoothing)
+    if not all(math.isfinite(value) for value in numeric):
+        raise SystemExit("Числові параметри навчання мають бути скінченними.")
+    if args.image_size < 1 or args.det_size < 1 or args.width <= 0 or args.crop_scale <= 0:
+        raise SystemExit("Розміри зображення, детектора, ширина моделі й crop-scale мають бути більшими за нуль.")
+    if args.lr <= 0 or args.weight_decay < 0:
+        raise SystemExit("--lr має бути більшим за нуль, --weight-decay — невід’ємним.")
+    if not 0 <= args.val_ratio or not 0 <= args.test_ratio or args.val_ratio + args.test_ratio >= 1:
+        raise SystemExit("--val-ratio і --test-ratio мають бути невід’ємними, а їхня сума — меншою за 1.")
+    if not 0 <= args.apcer <= 1 or not 0 <= args.label_smoothing < 1:
+        raise SystemExit("--apcer має бути від 0 до 1, а --label-smoothing — від 0 включно до 1.")
+    if args.folds < 0:
+        raise SystemExit("--folds не може бути від’ємним.")
+
+
 def train(args: argparse.Namespace) -> None:
     import torch
 
+    _validate_args(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -420,6 +463,10 @@ def train(args: argparse.Namespace) -> None:
     train_items = [item for item in items if item[2] in train_ids]
     val_items = [item for item in items if item[2] in val_ids]
     test_items = [item for item in items if item[2] in test_ids]
+    _require_live_and_attack(train_items, "train")
+    _require_live_and_attack(val_items, "validation")
+    if test_items:
+        _require_live_and_attack(test_items, "test")
     print(f"Людей: train {len(train_ids)}, validation {len(val_ids)}, test {len(test_ids)}. Кадрів: {len(train_items)}/{len(val_items)}/{len(test_items)}.")
     result = train_one(args, train_items, val_items, args.run_name)
     model = result["model"]
@@ -435,10 +482,12 @@ def train(args: argparse.Namespace) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     weights = Path(args.weights) if args.weights else ANTISPOOF_WEIGHTS
     meta_path = Path(args.meta) if args.meta else ANTISPOOF_META
+    weights.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), weights)
     meta = {
         "arch": args.arch,
-        "pretrained": bool(args.pretrained and args.arch != "topologies_mnv2"),
+        "pretrained": bool(args.pretrained and args.arch in {"mnv3_small", "mnv3_large"}),
         "width_multiplier": args.width,
         "image_size": args.image_size,
         "input": args.input,
@@ -455,6 +504,7 @@ def train(args: argparse.Namespace) -> None:
         "split": {"seed": args.seed, "train": sorted(train_ids), "val": sorted(val_ids), "test": sorted(test_ids)},
         "test_person_disjoint": disjoint,
         "best_epoch": result["best_epoch"],
+        "training_seconds": result["training_seconds"],
         "validation": validation,
         "test": test,
         "history": result["history"],
@@ -466,20 +516,24 @@ def train(args: argparse.Namespace) -> None:
     print(f"Збережено опис {meta_path}")
 
 
-def run_smoke() -> None:
+def run_smoke(args: argparse.Namespace | None = None) -> None:
     """Перевірка циклу без датасету: випадкові картинки, одна епоха, без збереження."""
     import tempfile
 
     from src.images import imwrite
 
+    if args is None:
+        args = parse_args(["--smoke", "--image-size", "64", "--epochs", "1", "--batch-size", "8", "--no-pretrained"])
+    args.epochs = 1
+    args.pretrained = False
+    args.image_size = min(args.image_size, 64)
     rng = np.random.default_rng(0)
     with tempfile.TemporaryDirectory() as folder:
         items = []
         for index in range(24):
             path = Path(folder) / f"{index}.jpg"
-            imwrite(path, rng.integers(0, 255, size=(64, 64, 3), dtype=np.uint8))
+            imwrite(path, rng.integers(0, 255, size=(args.image_size, args.image_size, 3), dtype=np.uint8))
             items.append((path, index % 3, f"p{index % 6}"))
-        args = parse_args(["--smoke", "--image-size", "64", "--epochs", "1", "--batch-size", "8", "--no-pretrained"])
         result = train_one(args, items[:18], items[18:], "smoke")
         temperature, threshold, source = calibrate(args, result["model"], items[18:])
         print(f"Smoke-навчання пройшло: {result['history'][-1]}, T {temperature:.2f}, поріг {threshold:.2f} ({source}).")
@@ -488,7 +542,7 @@ def run_smoke() -> None:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Навчити захист від підробки обличчя")
     parser.add_argument("--data", type=Path, nargs="+", help="Одна чи кілька папок live/print/phone/laptop/screen")
-    parser.add_argument("--arch", default="mnv3_small", choices=["mnv3_small", "mnv3_large", "topologies_mnv2"])
+    parser.add_argument("--arch", default="mnv3_small", choices=ARCHES)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True, help="Ваги ImageNet для MobileNetV3")
     parser.add_argument("--width", type=float, default=0.5, help="width_multiplier для topologies_mnv2")
     parser.add_argument("--input", default="context", choices=["context", "aligned"], help="Кроп з контекстом або вузький ArcFace-кроп")
@@ -522,7 +576,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 if __name__ == "__main__":
     arguments = parse_args()
     if arguments.smoke:
-        run_smoke()
+        run_smoke(arguments)
     else:
         if not arguments.data:
             raise SystemExit("Потрібен шлях --data або прапорець --smoke.")

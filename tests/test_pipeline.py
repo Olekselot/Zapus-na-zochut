@@ -96,6 +96,21 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(self.bank.balance_of(1), 975)
         self.assertEqual(decision.client_code, "p01")
 
+    def test_invalid_amounts_are_rejected_and_logged(self) -> None:
+        anti = FakeAnti(LIVE)
+        pipeline = self._pipeline(anti)
+
+        for amount in (float("nan"), float("inf"), -1, 0):
+            with self.subTest(amount=amount):
+                decision, _preview = pipeline.pay([IMAGE], amount)
+                self.assertEqual(decision.status, "error")
+
+        self.assertEqual(self.bank.balance_of(1), 1000)
+        self.assertEqual(anti.calls, 0)
+        self.assertEqual(len(self.bank.transactions()), 4)
+        self.assertTrue(all(row["статус"] == "error" for row in self.bank.transactions()))
+        self.assertTrue(all(row["сума"] is None for row in self.bank.transactions()))
+
     def test_blocks_spoof(self) -> None:
         decision, _preview = self._pipeline(FakeAnti(SCREEN)).pay([IMAGE], 25)
         self.assertEqual(decision.status, "spoof")
@@ -224,6 +239,15 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.bank.balance_of(1), 40)
         self.assertEqual(self.bank.accounts()[0]["векторів"], 3)
         self.assertEqual(self.pipeline.confirm_new(pending).status, "error")
+
+    def test_invalid_balances_are_rejected(self) -> None:
+        for balance in (float("nan"), float("inf"), -1, 0):
+            with self.subTest(balance=balance):
+                decision, pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], balance)
+                self.assertEqual(decision.status, "error")
+                self.assertIsNone(pending)
+
+        self.assertEqual(self.bank.accounts(), [])
 
     def test_stranger_cannot_take_over_account_by_name(self) -> None:
         self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40)
