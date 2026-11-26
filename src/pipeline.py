@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 from dataclasses import dataclass
 
@@ -149,7 +150,7 @@ class Pipeline:
             last = _clean_name(last_name, "Прізвище")
         except ValueError as error:
             return Decision("error", str(error), title="Помилка"), None
-        if balance <= 0 or balance > MAX_AMOUNT:
+        if not math.isfinite(balance) or balance <= 0 or balance > MAX_AMOUNT:
             return Decision("error", f"Початковий баланс має бути від 0.01 до {MAX_AMOUNT:.0f} грн.", title="Помилка"), None
         pin = (pin or "").strip()
         if pin and not valid_pin(pin):
@@ -297,8 +298,10 @@ class Pipeline:
         pin: str | None = None,
         challenge: str | None = None,
     ) -> tuple[Decision, np.ndarray | None]:
-        if amount <= 0 or amount > MAX_AMOUNT:
-            return Decision("error", f"Сума має бути від 0.01 до {MAX_AMOUNT:.0f} грн.", title="Помилка"), None
+        if not math.isfinite(amount) or amount <= 0 or amount > MAX_AMOUNT:
+            decision = Decision("error", f"Сума має бути від 0.01 до {MAX_AMOUNT:.0f} грн.", title="Помилка")
+            self._log(decision, None)
+            return decision, None
         amount = round(float(amount), 2)
         samples = self._samples(images)
         preview = None if not samples else _preview(samples[0])
@@ -439,7 +442,7 @@ class Pipeline:
         query = template([sample.embedding for sample in samples])
         return best_match(query, self.bank.gallery(), threshold, MATCH_MARGIN)
 
-    def _log(self, decision: Decision, amount: float, client_id: int | None = None) -> None:
+    def _log(self, decision: Decision, amount: float | None, client_id: int | None = None) -> None:
         self.bank.record(
             status=decision.status,
             amount=amount,

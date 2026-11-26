@@ -75,25 +75,31 @@ python app.py
   - Додати в `eval/identification_metrics.py` вибір порогу за цільовим FPIR, наприклад 1 %.
   - Записувати поріг разом з N у `models/recognition_threshold.json`.
   - Так само вивести поріг для великих сум замість довільних +0,10 і показати, скільки це коштує у FNIR.
-- [ ] **A4. Навчити захист від підробки.** Два способи:
+- [x] **A4. Навчити захист від підробки.** 26.11.2026:
+  Натреновано `mnv3_small` з ImageNet на 15 718 записах навчального набору. Ваги й метадані:
+  `models/antispoof.pt`, `models/antispoof_meta.json`; криві — `eval/results/antispoof_training_imagenet.png`.
+  Найкраща validation епоха — 8. Два способи:
   - у Colab: `notebooks/train_antispoof_colab.ipynb`, він сам завантажує дані;
   - локально: `python training/train_antispoof.py --data data/celeba_spoof --balance --test-ratio 0 --epochs 8 --patience 3`.
 
   Готово, коли є `models/antispoof.pt` і `models/antispoof_meta.json`, а крива навчання лежить у `eval/results/`.
 
   Обмеження для звіту: у дзеркалі немає ID людей, тому кожне фото вважається окремою людиною. Фото однієї людини потрапляють і в train, і у validation. Поріг і температура калібруються на такій завищеній validation, тож чесні числа дає лише A5.
-- [ ] **A5. Метрики захисту.** `python eval/antispoof_metrics.py --data data/celeba_spoof_test --split all`. У RESULTS.md переносяться APCER, BPCER, BPCER при APCER 1/5/10 %, DET-крива і матриця помилок.
+- [x] **A5. Метрики захисту.** 26.11.2026:
+  На окремому test-наборі CelebA-Spoof: APCER 24,68 %, BPCER 0,73 %, ACER 12,71 %, 2149 валідних кадрів.
+  Звіт — `eval/results/antispoof_celeba_spoof_test_all_antispoof.json`, DET-крива — відповідний PNG. `python eval/antispoof_metrics.py --data data/celeba_spoof_test --split all`. У RESULTS.md переносяться APCER, BPCER, BPCER при APCER 1/5/10 %, DET-крива і матриця помилок.
 - [ ] **A6. З нуля проти ImageNet.** Викладач оцінює саме навчання, тож ця таблиця головна.
   1. Додати в `eval/antispoof_metrics.py` аргументи `--weights` і `--meta`. Зараз він оцінює лише `models/antispoof.pt`.
   2. Навчити:
 
      ```text
-     python training/train_antispoof.py --data data/celeba_spoof --balance --test-ratio 0 --arch topologies_mnv2 --run-name scratch --weights models/antispoof_scratch.pt --meta models/antispoof_scratch_meta.json
+     python training/train_antispoof.py --data data/celeba_spoof --balance --test-ratio 0 --arch mnv2_scratch --run-name scratch --weights models/antispoof_scratch.pt --meta models/antispoof_scratch_meta.json
+     python eval/antispoof_metrics.py --data data/celeba_spoof_test --split all --weights models/antispoof_scratch.pt --meta models/antispoof_scratch_meta.json --name antispoof_scratch_test
      ```
 
-     Без `--weights` прогін перезапише основну модель.
+     `mnv2_scratch` використовує MobileNetV2 з torchvision і не потребує пакета Topologies. Без `--weights` прогін перезапише основну модель; для порівняння кожна архітектура має власні ваги й метадані.
   3. У RESULTS.md — таблиця: архітектура × APCER, BPCER, кількість епох, час навчання.
-- [ ] **A7. Ваги в репозиторій.** Через `models/*` у `.gitignore` моделі не потраплять ні до тіммейтів, ні на ноутбук викладача. Додати винятки `!models/antispoof.pt`, `!models/antispoof_meta.json`, `!models/recognition_threshold.json`. Модель MobileNetV3-Small займає кілька мегабайт.
+- [x] **A7. Ваги в репозиторій.** Додано винятки для `models/antispoof.pt`, `models/antispoof_meta.json` і `models/recognition_threshold.json`. Модель і метадані першого повного тренування тепер можуть потрапити в git.
 - [ ] **A8. Затримка.** Написати скрипт, що міряє p50 і p95 на ~50 оплатах, окремо для двох випадків:
   - холодний старт: `build_demo()` разом із завантаженням моделей;
   - гарячий: детектор, ArcFace, захист і пошук.

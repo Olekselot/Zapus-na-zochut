@@ -77,6 +77,7 @@ def _card(text: str, title: str = "Помилка") -> str:
 def build_demo() -> gr.Blocks:
     bank = Bank()
     antispoof = AntispoofModel()
+    antispoof.warm_up()
     pipeline = Pipeline(bank, FaceEngine(), antispoof)
     camera_index = int(os.environ.get("CAMERA_INDEX", "0"))
     admin_pin = os.environ.get("ADMIN_PIN", "")

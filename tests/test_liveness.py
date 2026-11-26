@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from src.challenge import check_blink, check_turn, eye_aspect_ratio, random_challenge
+from src.folders import Sample
 from src.images import context_crop
 from src.quality import blur_score, yaw_proxy
 
@@ -85,6 +89,28 @@ class ImageTests(unittest.TestCase):
         self.assertTrue(np.array_equal(first, second))
 
 
+class AntispoofMetricsPathTests(unittest.TestCase):
+    def test_select_uses_the_requested_models_metadata(self) -> None:
+        from eval.antispoof_metrics import select
+
+        with tempfile.TemporaryDirectory() as folder:
+            meta_path = Path(folder) / "scratch_meta.json"
+            meta_path.write_text('{"split":{"test":["p02"]}}', encoding="utf-8")
+            samples = [
+                Sample(Path("p01.jpg"), 0, "p01"),
+                Sample(Path("p02.jpg"), 1, "p02"),
+            ]
+
+            self.assertEqual(select(samples, "test", Path(folder), meta_path), [samples[1]])
+
+    def test_model_warm_up_reports_missing_artifacts(self) -> None:
+        from src.antispoof import AntispoofModel
+
+        with tempfile.TemporaryDirectory() as folder:
+            model = AntispoofModel(Path(folder) / "missing.pt", Path(folder) / "missing.json")
+            self.assertFalse(model.warm_up())
+
+
 @unittest.skipUnless(HAS_TORCH, "потрібен torch")
 class TrainingTests(unittest.TestCase):
     def test_partial_loss_for_unknown_spoof(self) -> None:
@@ -109,6 +135,105 @@ class TrainingTests(unittest.TestCase):
         labels = torch.randint(0, 3, (300,))
         logits = torch.randn(300, 3) * 8
         self.assertGreater(fit_temperature(logits, labels), 1.5)
+
+    def test_mobilenet_v2_scratch_builds_without_topologies(self) -> None:
+        import torch
+
+        from src.antispoof import build_model
+
+        model, head = build_model("mnv2_scratch", num_classes=3, width_multiplier=0.25)
+        model.eval()
+        with torch.inference_mode():
+            logits = model(torch.zeros((1, 3, 64, 64)))
+
+        self.assertEqual(tuple(logits.shape), (1, 3))
+        self.assertTrue(head)
+
+    def test_worker_loader_uses_epoch_specific_augmentations(self) -> None:
+        import torch
+        from PIL import Image
+
+        from training.train_antispoof import CropDataset, _loader
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "face.png"
+            pixels = np.random.default_rng(42).integers(0, 255, (64, 64, 3), dtype=np.uint8)
+            Image.fromarray(pixels).save(path)
+            dataset = CropDataset([(path, 0, "p01")], image_size=64, augment=True, seed=7)
+            loader = _loader(dataset, 1, shuffle=False, balance=False, workers=1, seed=7)
+
+            dataset.epoch = 0
+            first_iterator = iter(loader)
+            first = next(first_iterator)[0]
+            del first_iterator
+            dataset.epoch = 1
+            second_iterator = iter(loader)
+            second = next(second_iterator)[0]
+            del second_iterator
+
+        self.assertFalse(torch.equal(first, second))
+
+    def test_training_saves_weights_and_run_metadata(self) -> None:
+        import json
+        import torch
+        from PIL import Image
+
+        from training import train_antispoof
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            rng = np.random.default_rng(42)
+            items = []
+            for person in range(6):
+                for label in (0, 1):
+                    path = root / f"p{person}_{label}.png"
+                    Image.fromarray(rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)).save(path)
+                    items.append((path, label, f"p{person}"))
+
+            weights = root / "models" / "scratch.pt"
+            meta_path = root / "models" / "scratch_meta.json"
+            results_dir = root / "results"
+            args = train_antispoof.parse_args(
+                [
+                    "--data",
+                    str(root),
+                    "--arch",
+                    "mnv2_scratch",
+                    "--no-pretrained",
+                    "--epochs",
+                    "1",
+                    "--image-size",
+                    "64",
+                    "--batch-size",
+                    "8",
+                    "--run-name",
+                    "unit",
+                    "--weights",
+                    str(weights),
+                    "--meta",
+                    str(meta_path),
+                ]
+            )
+            with (
+                patch.object(train_antispoof, "prepare", return_value=([], items)),
+                patch.object(train_antispoof, "MODELS_DIR", root / "models"),
+                patch.object(train_antispoof, "RESULTS_DIR", results_dir),
+                patch.object(torch, "set_num_threads"),
+            ):
+                train_antispoof.train(args)
+
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertTrue(weights.is_file())
+            self.assertEqual(metadata["arch"], "mnv2_scratch")
+            self.assertEqual(metadata["best_epoch"], 1)
+            self.assertIn("training_seconds", metadata)
+            self.assertFalse(metadata["pretrained"])
+            self.assertTrue((results_dir / "antispoof_training_unit.png").is_file())
+            from src.antispoof import AntispoofModel
+
+            model = AntispoofModel(weights, meta_path)
+            probabilities = model.predict_proba([np.zeros((64, 64, 3), dtype=np.uint8)])
+            self.assertEqual(tuple(probabilities.shape), (1, 3))
 
 
 if __name__ == "__main__":

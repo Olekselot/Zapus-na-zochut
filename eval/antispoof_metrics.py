@@ -19,15 +19,15 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from src.antispoof import AntispoofModel  # noqa: E402
-from src.config import ANTISPOOF_META, CLASS_NAMES, LABEL_NAMES, RESULTS_DIR  # noqa: E402
+from src.config import ANTISPOOF_META, ANTISPOOF_WEIGHTS, CLASS_NAMES, LABEL_NAMES, RESULTS_DIR  # noqa: E402
 from src.folders import collect_samples  # noqa: E402
 from src.metrics import bpcer_at_apcer, det_curve, live_mask_from_probs, presentation_rates  # noqa: E402
 
 
-def select(samples, split: str, data: Path):
+def select(samples, split: str, data: Path, meta_path: Path = ANTISPOOF_META):
     if split == "all":
         return samples
-    meta = json.loads(ANTISPOOF_META.read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     people = set(meta.get("split", {}).get(split, []))
     if not people:
         raise SystemExit(f"У метаданих моделі немає частини {split}. Перенавчіть модель або візьміть --split all.")
@@ -68,18 +68,20 @@ def main() -> None:
     parser.add_argument("--split", default="test", choices=["test", "val", "train", "all"])
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--name", default=None, help="Ім'я файла звіту")
+    parser.add_argument("--weights", type=Path, default=ANTISPOOF_WEIGHTS, help="Файл ваг моделі")
+    parser.add_argument("--meta", type=Path, default=ANTISPOOF_META, help="Метадані цієї моделі")
     args = parser.parse_args()
-    model = AntispoofModel()
+    model = AntispoofModel(args.weights, args.meta)
     if not model.available:
-        raise SystemExit("Немає models/antispoof.pt. Спочатку навчіть модель.")
-    samples = select(collect_samples(args.data, tag=args.data.name), args.split, args.data)
+        raise SystemExit(f"Немає ваг або метаданих моделі: {args.weights}, {args.meta}. Спочатку навчіть модель.")
+    samples = select(collect_samples(args.data, tag=args.data.name), args.split, args.data, args.meta)
     if args.limit:
         samples = samples[: args.limit]
 
     from src.faces import FaceEngine
     from src.images import imread
 
-    meta = json.loads(ANTISPOOF_META.read_text(encoding="utf-8"))
+    meta = json.loads(args.meta.read_text(encoding="utf-8"))
     engine = FaceEngine(det_size=int(meta.get("det_size", 640)), with_landmarks=False)
     faces, labels = [], []
     missed = np.zeros(len(LABEL_NAMES), dtype=int)
@@ -103,7 +105,7 @@ def main() -> None:
     live_found = int((label_array == 0).sum())
     system_bpcer = (int((~accepted[label_array == 0]).sum()) + int(missed[0])) / max(live_found + int(missed[0]), 1)
     at_apcer = bpcer_at_apcer(probabilities, label_array)
-    name = args.name or f"antispoof_{args.data.name}_{args.split}"
+    name = args.name or f"antispoof_{args.data.name}_{args.split}_{args.weights.stem}"
     print(f"Кадрів: {len(labels)} ({len({s.person for s in samples})} людей), без обличчя: {missed.tolist()}, поріг {model.threshold:.3f}.")
     print(f"APCER {rates.apcer:.3f} (найгірший) за типами: { {key: round(value, 3) for key, value in rates.apcer_by_type.items()} }.")
     print(f"BPCER {rates.bpcer:.3f}; з урахуванням кадрів без обличчя {system_bpcer:.3f}.")
@@ -118,6 +120,14 @@ def main() -> None:
         json.dumps(
             {
                 "data": str(args.data),
+                "weights": str(args.weights),
+                "meta": str(args.meta),
+                "model": {
+                    "arch": meta.get("arch"),
+                    "pretrained": meta.get("pretrained"),
+                    "best_epoch": meta.get("best_epoch"),
+                    "training_seconds": meta.get("training_seconds"),
+                },
                 "split": args.split,
                 "people": len({sample.person for sample in samples}),
                 "frames": len(labels),

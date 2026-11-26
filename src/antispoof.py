@@ -21,7 +21,7 @@ from src.config import (
 )
 from src.images import face_tensor
 
-ARCHES = ("mnv3_small", "mnv3_large", "topologies_mnv2")
+ARCHES = ("mnv3_small", "mnv3_large", "mnv2_scratch", "topologies_mnv2")
 
 
 @dataclass
@@ -50,6 +50,9 @@ def build_model(arch: str = "mnv3_small", num_classes: int = 3, width_multiplier
         raise ValueError(f"невідома архітектура {arch}, доступні: {', '.join(ARCHES)}")
     from torchvision import models
 
+    if arch == "mnv2_scratch":
+        model = models.mobilenet_v2(weights=None, num_classes=num_classes, width_mult=width_multiplier)
+        return model, list(model.classifier.parameters())
     if arch == "mnv3_small":
         weights = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
         model = models.mobilenet_v3_small(weights=weights)
@@ -87,6 +90,13 @@ class AntispoofModel:
     @property
     def available(self) -> bool:
         return self.weights_path.exists() and self.meta_path.exists()
+
+    def warm_up(self) -> bool:
+        """Завантажити ваги під час старту застосунку, а не перед першою оплатою."""
+        if not self.available:
+            return False
+        self._ensure()
+        return True
 
     def _read_spec(self) -> AntispoofSpec:
         if self.spec is None:
