@@ -101,6 +101,25 @@ def choose_live_threshold(probs: np.ndarray, labels: np.ndarray, apcer_target: f
     return best_threshold
 
 
+def threshold_for_bpcer(probs: np.ndarray, labels: np.ndarray, bpcer_target: float = 0.05) -> float:
+    """Найвищий поріг P(live), за якого BPCER ще не вищий за ціль.
+
+    Обмежуємо відмови живим людям і за цієї умови пропускаємо якомога менше атак.
+    Корисно, коли ціль за APCER дає неприйнятний BPCER.
+    """
+    matrix = np.asarray(probs, dtype=np.float64)
+    classes = _labels(labels)
+    if len(matrix) != len(classes):
+        raise ValueError("ймовірності і мітки різної довжини")
+    if not (classes == 0).any():
+        raise ValueError("для порогу потрібні живі кадри")
+    best = 0.0
+    for threshold in _candidates(matrix):
+        if presentation_rates(classes, live_mask_from_probs(matrix, float(threshold))).bpcer <= bpcer_target:
+            best = max(best, float(threshold))
+    return best
+
+
 def det_curve(probs: np.ndarray, labels: np.ndarray) -> list[tuple[float, float, float]]:
     """(поріг, найгірший APCER, BPCER) для кожного порогу — точки DET-кривої."""
     matrix = np.asarray(probs, dtype=np.float64)

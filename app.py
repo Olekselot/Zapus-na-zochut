@@ -82,7 +82,7 @@ def build_demo() -> gr.Blocks:
     camera_index = int(os.environ.get("CAMERA_INDEX", "0"))
     admin_pin = os.environ.get("ADMIN_PIN", "")
 
-    account_headers = ["клієнт", "баланс", "векторів", "PIN", "зареєстровано"]
+    account_headers = ["код", "клієнт", "баланс", "векторів", "PIN", "зареєстровано"]
     journal_headers = ["час", "статус", "клієнт", "сума", "схожість", "живість", "деталі"]
 
     def tables():
@@ -115,6 +115,16 @@ def build_demo() -> gr.Blocks:
             return guard_view(), "Невірний PIN адміністратора, стан захисту не змінено.", banner()
         pipeline.toggle_antispoof()
         return guard_view(), "", banner()
+
+    def unlock_pin(entered_pin, code):
+        if admin_pin and not hmac.compare_digest(str(entered_pin or ""), admin_pin):
+            return "Невірний PIN адміністратора, PIN клієнта не розблоковано.", *tables()
+        code = str(code or "").strip()
+        if not code:
+            return "Вкажіть код клієнта з таблиці рахунків, наприклад c1.", *tables()
+        if bank.unlock_pin(code):
+            return f"PIN клієнта {code} розблоковано.", *tables()
+        return f"Клієнта з кодом {code} немає.", *tables()
 
     def pay_photo(image, amount, pin):
         if image is None:
@@ -228,6 +238,9 @@ def build_demo() -> gr.Blocks:
                     refresh = gr.Button("Оновити", scale=1, elem_id="refresh-button")
                 admin_box = gr.Textbox(label="PIN адміністратора", type="password", max_lines=1, visible=bool(admin_pin))
                 guard_note = gr.Markdown()
+                with gr.Row():
+                    unlock_code = gr.Textbox(label="Код клієнта (з таблиці)", max_lines=1, placeholder="c1", scale=2)
+                    unlock_button = gr.Button("Розблокувати PIN", scale=1)
                 accounts = gr.Dataframe(headers=account_headers, label="Рахунки", interactive=False, type="array")
                 journal = gr.Dataframe(headers=journal_headers, label="Журнал операцій", interactive=False, type="array")
 
@@ -248,6 +261,7 @@ def build_demo() -> gr.Blocks:
             tables, None, [accounts, journal]
         )
         guard_button.click(toggle_guard, [admin_box], [guard_button, guard_note, warning])
+        unlock_button.click(unlock_pin, [admin_box, unlock_code], [guard_note, accounts, journal])
         refresh.click(on_load, None, [accounts, journal, guard_button, warning])
         demo.load(on_load, None, [accounts, journal, guard_button, warning])
     return demo

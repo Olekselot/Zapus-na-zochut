@@ -6,6 +6,7 @@ import html
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 
@@ -19,6 +20,7 @@ from src.config import (
     HIGH_AMOUNT_EXTRA,
     MATCH_MARGIN,
     MAX_AMOUNT,
+    MIN_ENROLL_PHOTOS,
     load_recognition_threshold,
 )
 from src.decisions import summarize_liveness
@@ -123,6 +125,7 @@ class Pipeline:
         self.antispoof = antispoof
         self.rules = rules or QualityRules()
         self.antispoof_enabled = True
+        self.min_enroll_photos = MIN_ENROLL_PHOTOS
 
     def toggle_antispoof(self) -> bool:
         """Повертає новий стан: True, якщо перевірка живості знову увімкнена."""
@@ -187,6 +190,17 @@ class Pipeline:
                 ), None
             spoofed = int((~live).sum())
             kept = [sample for sample, ok in zip(kept, live) if ok]
+
+        if len(kept) < self.min_enroll_photos:
+            reason = f" Найчастіша причина: {main_problem(issues)}." if issues else ""
+            if spoofed:
+                reason += f" Схожих на підробку: {spoofed}."
+            return Decision(
+                "poor_quality",
+                f"Придатних фото {len(kept)} з {len(images)}, а потрібно щонайменше {self.min_enroll_photos}: "
+                f"анфас, різкі, одна людина в кадрі.{reason}",
+                title="Замало фото",
+            ), None
 
         embeddings = [sample.embedding.astype(np.float32).tolist() for sample in kept]
         note = _photo_note(len(kept), len(images), spoofed)
@@ -319,10 +333,13 @@ class Pipeline:
                 return reject("challenge_failed", f"Завдання «{CHALLENGES.get(challenge, challenge)}» не виконано: {note}", "Завдання не виконано")
         if any(sample.faces_found > 1 and sample.second_face_ratio >= self.rules.multi_face_ratio for sample in samples):
             return reject("multi_face", "У кадрі кілька облич. Оплата проходить, коли перед камерою одна людина.", "Кілька облич")
+        dropped = 0
         if len(samples) > 1:
             keep, _template = consistent([sample.embedding for sample in samples], CONSISTENCY_THRESHOLD)
-            if len(keep) < len(samples):
+            if len(keep) * 2 <= len(samples):
                 return reject("inconsistent", "У кадрах різні люди. Оплату зупинено.", "Різні люди в кадрах")
+            dropped = len(samples) - len(keep)
+            samples = [samples[index] for index in keep]
         kept, issues = split_by_quality(samples, self.rules)
         if not kept or (not challenge and len(kept) < min_faces):
             return reject("poor_quality", f"Кадр не підходить: {main_problem(issues)}.", "Поганий кадр")
@@ -385,7 +402,7 @@ class Pipeline:
                 "none": (f"Для сум понад {HIGH_AMOUNT:.0f} грн потрібен PIN, а клієнт його не задав.", "Потрібен PIN", "pin_required"),
                 "missing": (f"Сума понад {HIGH_AMOUNT:.0f} грн: введіть PIN.", "Потрібен PIN", "pin_required"),
                 "wrong": ("Невірний PIN. Оплату не проведено.", "Невірний PIN", "pin_wrong"),
-                "locked": ("PIN заблоковано після кількох помилок. Оплати понад ліміт недоступні.", "PIN заблоковано", "pin_locked"),
+                "locked": (_locked_text(self.bank.pin_locked_until(int(match.client_id))), "PIN заблоковано", "pin_locked"),
             }
             if pin_state in texts:
                 message, title, status = texts[pin_state]
@@ -394,7 +411,8 @@ class Pipeline:
 
         live_part = "захист вимкнено" if live_score is None else f"живість {live_score:.3f}"
         challenge_part = f", завдання {challenge}" if challenge else ""
-        detail = f"кадрів {len(kept)}, {live_part}{challenge_part}{pin_note}"
+        dropped_part = f" ({dropped} відкинуто)" if dropped else ""
+        detail = f"кадрів {len(kept)}{dropped_part}, {live_part}{challenge_part}{pin_note}"
         status, balance = self.bank.record(
             status="paid",
             amount=amount,
@@ -461,12 +479,17 @@ def _clean_name(value: str, label: str) -> str:
     return cleaned
 
 
+def _locked_text(until: float | None) -> str:
+    when = f" до {datetime.fromtimestamp(until).strftime('%H:%M')}" if until else ""
+    return f"PIN заблоковано{when} після кількох помилок поспіль. Оплати понад ліміт тимчасово недоступні."
+
+
 def _photo_note(kept: int, total: int, spoofed: int = 0) -> str:
     extra = ""
     if spoofed:
         extra += f" Відкинуто фото, схожих на підробку: {spoofed}."
     if kept + spoofed < total:
         extra += f" Пропущено непридатних фото: {total - kept - spoofed}."
-    if kept < 3:
-        extra += " Для стабільної оплати краще додати щонайменше 8 фото."
+    if kept < 8:
+        extra += " Для стабільної оплати краще мати 8 і більше фото."
     return extra

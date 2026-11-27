@@ -8,6 +8,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -15,7 +16,14 @@ from pathlib import Path
 
 import numpy as np
 
-from src.config import DB_PATH, EMBEDDING_DIM, PIN_MAX_FAILURES, ensure_runtime_dirs
+from src.config import (
+    DB_PATH,
+    EMBEDDING_DIM,
+    PIN_LOCK_MAX_SECONDS,
+    PIN_LOCK_SECONDS,
+    PIN_MAX_FAILURES,
+    ensure_runtime_dirs,
+)
 from src.gallery import l2_normalize
 
 PIN_PATTERN = re.compile(r"^\d{4,6}$")
@@ -30,6 +38,8 @@ CREATE TABLE IF NOT EXISTS clients (
     last_name TEXT NOT NULL DEFAULT '',
     pin_hash TEXT NOT NULL DEFAULT '',
     pin_failures INTEGER NOT NULL DEFAULT 0,
+    pin_locked_until REAL NOT NULL DEFAULT 0,
+    pin_lock_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -113,9 +123,18 @@ def check_pin(pin: str, stored: str) -> bool:
     return hmac.compare_digest(digest.hex(), expected)
 
 
+def _pin_state(pin_hash: str, locked_until: float, now: float) -> str:
+    if not pin_hash:
+        return "ні"
+    if locked_until > now:
+        return "заблоковано до " + datetime.fromtimestamp(locked_until).strftime("%H:%M")
+    return "так"
+
+
 class Bank:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, clock=time.time) -> None:
         ensure_runtime_dirs()
+        self._clock = clock
         self.path = Path(path) if path is not None else DB_PATH
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -176,6 +195,8 @@ class Bank:
             ("last_name", "TEXT NOT NULL DEFAULT ''"),
             ("pin_hash", "TEXT NOT NULL DEFAULT ''"),
             ("pin_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ("pin_locked_until", "REAL NOT NULL DEFAULT 0"),
+            ("pin_lock_count", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in clients:
                 connection.execute(f"ALTER TABLE clients ADD COLUMN {name} {ddl}")
@@ -330,26 +351,63 @@ class Bank:
         return bool(row and row["pin_hash"])
 
     def verify_pin(self, client_id: int, pin: str) -> str:
-        """ok, wrong, locked або none. Після PIN_MAX_FAILURES помилок поспіль PIN блокується."""
+        """ok, wrong, locked або none.
+
+        Після PIN_MAX_FAILURES помилок поспіль PIN блокується на PIN_LOCK_SECONDS,
+        кожне наступне блокування вдвічі довше, але не довше за добу. Правильний PIN
+        або адміністратор знімають блокування і скидають лічильники.
+        """
+        now = float(self._clock())
         with self._write() as connection:
             row = connection.execute(
-                "SELECT pin_hash, pin_failures FROM clients WHERE id = ?", (int(client_id),)
+                "SELECT pin_hash, pin_failures, pin_locked_until, pin_lock_count FROM clients WHERE id = ?",
+                (int(client_id),),
             ).fetchone()
             if row is None or not row["pin_hash"]:
                 return "none"
-            if int(row["pin_failures"]) >= PIN_MAX_FAILURES:
+            if float(row["pin_locked_until"]) > now:
                 return "locked"
             if check_pin(pin, str(row["pin_hash"])):
-                connection.execute("UPDATE clients SET pin_failures = 0 WHERE id = ?", (int(client_id),))
+                connection.execute(
+                    "UPDATE clients SET pin_failures = 0, pin_locked_until = 0, pin_lock_count = 0 WHERE id = ?",
+                    (int(client_id),),
+                )
                 return "ok"
-            connection.execute("UPDATE clients SET pin_failures = pin_failures + 1 WHERE id = ?", (int(client_id),))
-            return "locked" if int(row["pin_failures"]) + 1 >= PIN_MAX_FAILURES else "wrong"
+            failures = int(row["pin_failures"]) + 1
+            if failures < PIN_MAX_FAILURES:
+                connection.execute("UPDATE clients SET pin_failures = ? WHERE id = ?", (failures, int(client_id)))
+                return "wrong"
+            locks = int(row["pin_lock_count"]) + 1
+            seconds = min(PIN_LOCK_SECONDS * 2 ** (locks - 1), PIN_LOCK_MAX_SECONDS)
+            connection.execute(
+                "UPDATE clients SET pin_failures = 0, pin_lock_count = ?, pin_locked_until = ? WHERE id = ?",
+                (locks, now + seconds, int(client_id)),
+            )
+            return "locked"
+
+    def pin_locked_until(self, client_id: int) -> float | None:
+        """Момент (time.time), до якого PIN заблоковано, або None."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT pin_locked_until FROM clients WHERE id = ?", (int(client_id),)).fetchone()
+        if row is None or float(row["pin_locked_until"]) <= float(self._clock()):
+            return None
+        return float(row["pin_locked_until"])
+
+    def unlock_pin(self, code: str) -> bool:
+        """Розблокування адміністратором за кодом клієнта (c1, c2...)."""
+        with self._write() as connection:
+            cursor = connection.execute(
+                "UPDATE clients SET pin_failures = 0, pin_locked_until = 0, pin_lock_count = 0 WHERE code = ?",
+                (str(code).strip(),),
+            )
+            return cursor.rowcount == 1
 
     def accounts(self) -> list[dict[str, object]]:
+        now = float(self._clock())
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.code, c.first_name, c.last_name, c.pin_hash, a.balance_kop, c.created_at,
+                SELECT c.code, c.first_name, c.last_name, c.pin_hash, c.pin_locked_until, a.balance_kop, c.created_at,
                        (SELECT COUNT(*) FROM embeddings e WHERE e.client_id = c.id) AS vectors
                 FROM clients c
                 JOIN accounts a ON a.client_id = c.id
@@ -358,10 +416,11 @@ class Bank:
             ).fetchall()
         return [
             {
+                "код": str(row["code"]),
                 "клієнт": display_name(str(row["first_name"]), str(row["last_name"]), str(row["code"])),
                 "баланс": from_kop(row["balance_kop"]),
                 "векторів": int(row["vectors"]),
-                "PIN": "так" if row["pin_hash"] else "ні",
+                "PIN": _pin_state(str(row["pin_hash"]), float(row["pin_locked_until"]), now),
                 "зареєстровано": row["created_at"],
             }
             for row in rows

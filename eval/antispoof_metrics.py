@@ -25,9 +25,13 @@ from src.metrics import bpcer_at_apcer, det_curve, live_mask_from_probs, present
 
 
 def select(samples, split: str, data: Path, meta_path: Path = ANTISPOOF_META):
-    if split == "all":
-        return samples
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if split == "all":
+        calibration = set(meta.get("calibration", {}).get("people", []))
+        kept = [sample for sample in samples if sample.person not in calibration]
+        if len(kept) < len(samples):
+            print(f"Пропущено {len(samples) - len(kept)} фото, на яких підбирався поріг (training/calibrate_antispoof.py).")
+        return kept
     people = set(meta.get("split", {}).get(split, []))
     if not people:
         raise SystemExit(f"У метаданих моделі немає частини {split}. Перенавчіть модель або візьміть --split all.")

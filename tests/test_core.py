@@ -10,12 +10,13 @@ from pathlib import Path
 import numpy as np
 
 from src.bank import Bank, check_pin, hash_pin, to_kop
-from src.config import EMBEDDING_DIM, PIN_MAX_FAILURES
+from src.config import EMBEDDING_DIM, PIN_LOCK_SECONDS, PIN_MAX_FAILURES
 from src.folders import Sample, balance_classes, collect_samples, person_folds, split_by_person, stratified_limit
 from src.gallery import best_match, consistent, cosine, l2_normalize, template
 from src.metrics import (
     bpcer_at_apcer,
     choose_live_threshold,
+    threshold_for_bpcer,
     cross_validate,
     equal_error_point,
     live_mask_from_probs,
@@ -130,6 +131,31 @@ class BankTests(unittest.TestCase):
             other, _ = bank.register_person("Олена", "Іваненко", [_vector(2)], 100)
             self.assertEqual(bank.verify_pin(other, "1234"), "none")
 
+    def test_pin_lock_expires_doubles_and_can_be_unlocked(self) -> None:
+        now = [1_000_000.0]
+        with tempfile.TemporaryDirectory() as folder:
+            bank = Bank(Path(folder) / "bank.sqlite", clock=lambda: now[0])
+            client_id, _shown = bank.register_person("Іван", "Петренко", [_vector(1)], 100, pin="1234")
+            for _ in range(PIN_MAX_FAILURES):
+                bank.verify_pin(client_id, "0000")
+            self.assertEqual(bank.pin_locked_until(client_id), now[0] + PIN_LOCK_SECONDS)
+            self.assertTrue(bank.accounts()[0]["PIN"].startswith("заблоковано до"))
+            now[0] += PIN_LOCK_SECONDS - 1
+            self.assertEqual(bank.verify_pin(client_id, "1234"), "locked")
+            now[0] += 2
+            self.assertIsNone(bank.pin_locked_until(client_id))
+            states = [bank.verify_pin(client_id, "0000") for _ in range(PIN_MAX_FAILURES)]
+            self.assertEqual(states, ["wrong"] * (PIN_MAX_FAILURES - 1) + ["locked"])
+            self.assertEqual(bank.pin_locked_until(client_id), now[0] + 2 * PIN_LOCK_SECONDS)
+            code = bank.accounts()[0]["код"]
+            self.assertFalse(bank.unlock_pin("c999"))
+            self.assertTrue(bank.unlock_pin(code))
+            self.assertEqual(bank.accounts()[0]["PIN"], "так")
+            self.assertEqual(bank.verify_pin(client_id, "1234"), "ok")
+            for _ in range(PIN_MAX_FAILURES):
+                bank.verify_pin(client_id, "0000")
+            self.assertEqual(bank.pin_locked_until(client_id), now[0] + PIN_LOCK_SECONDS)
+
     def test_migrates_old_real_balance(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "bank.sqlite"
@@ -229,6 +255,18 @@ class MetricTests(unittest.TestCase):
         at = bpcer_at_apcer(probs, np.array([0, 0, 1, 0]), targets=(0.0,))
         self.assertAlmostEqual(at["0"], 1 / 3)
 
+    def test_bpcer_rule_limits_rejected_live_faces(self) -> None:
+        probs = np.array([[0.95, 0.03, 0.02], [0.85, 0.1, 0.05], [0.70, 0.2, 0.1], [0.75, 0.2, 0.05], [0.3, 0.6, 0.1]])
+        labels = np.array([0, 0, 0, 3, 3])
+        threshold = threshold_for_bpcer(probs, labels, bpcer_target=0.0)
+        self.assertAlmostEqual(threshold, 0.70)
+        rates = presentation_rates(labels, live_mask_from_probs(probs, threshold))
+        self.assertEqual(rates.bpcer, 0.0)
+        self.assertEqual(rates.apcer, 0.5)
+        loose = threshold_for_bpcer(probs, labels, bpcer_target=0.34)
+        self.assertAlmostEqual(loose, 0.85)
+        self.assertEqual(presentation_rates(labels, live_mask_from_probs(probs, loose)).apcer, 0.0)
+
 
 class FolderTests(unittest.TestCase):
     def _tree(self, root: Path, people=("p01", "p02", "p03", "p04"), kinds=("live", "print", "phone", "laptop")) -> None:
@@ -275,6 +313,30 @@ class FolderTests(unittest.TestCase):
                 (root / label / "1.jpg").write_bytes(b"x")
             labels = {sample.label for sample in collect_samples(root)}
             self.assertEqual(labels, {0, 3})
+
+
+
+class IdentificationScanTests(unittest.TestCase):
+    def test_stricter_threshold_lowers_fpir_and_raises_fnir(self) -> None:
+        from eval.identification_metrics import scan
+
+        rng = np.random.default_rng(0)
+        vectors, by_person = [], {}
+        for person in range(60):
+            center = _vector(1000 + person)
+            rows = []
+            for shot in range(5):
+                rows.append(len(vectors))
+                noisy = center + 0.9 * rng.normal(size=EMBEDDING_DIM) / np.sqrt(EMBEDDING_DIM)
+                vectors.append(noisy / np.linalg.norm(noisy))
+            by_person[f"p{person}"] = np.asarray(rows)
+        vectors = np.asarray(vectors, dtype=np.float32)
+        eligible = sorted(by_person)
+        table = scan(vectors, by_person, eligible, 20, 3, 0.05, 3, [0.05, 0.3, 0.95], np.random.default_rng(1))
+        self.assertGreater(table[0.05]["fpir"], table[0.3]["fpir"])
+        self.assertEqual(table[0.95]["fpir"], 0.0)
+        self.assertEqual(table[0.3]["fnir"], 0.0)
+        self.assertEqual(table[0.95]["fnir"], 1.0)
 
 
 if __name__ == "__main__":
