@@ -21,7 +21,13 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from eval.lfw import identity  # noqa: E402
-from src.config import MATCH_MARGIN, RESULTS_DIR, load_recognition_threshold  # noqa: E402
+from src.config import (  # noqa: E402
+    HIGH_AMOUNT_EXTRA,
+    MATCH_MARGIN,
+    RECOGNITION_THRESHOLD_PATH,
+    RESULTS_DIR,
+    load_recognition_threshold,
+)
 
 MODES = ("max", "template", "template+margin")
 
@@ -68,6 +74,72 @@ def trial(vectors, owners, by_person, gallery_people, outsiders, enroll, thresho
     return result
 
 
+def scan(vectors, by_person, eligible, size, enroll, margin, trials, grid, rng) -> dict[float, dict[str, float]]:
+    """FPIR/FNIR правила «шаблон + відрив» для кожного порогу сітки, на тих самих випадкових галереях."""
+    totals = {float(t): {"fpir": [], "fnir": [], "wrong_id": []} for t in grid}
+    for _ in range(trials):
+        gallery_people = list(rng.choice(eligible, size=size, replace=False))
+        chosen = set(gallery_people)
+        outsiders = [person for person in by_person if person not in chosen]
+        outsiders = list(rng.choice(outsiders, size=min(1000, len(outsiders)), replace=False))
+        templates, probes, truth = [], [], []
+        for index, person in enumerate(gallery_people):
+            rows = rng.permutation(by_person[person])
+            center = vectors[rows[:enroll]].mean(axis=0)
+            templates.append(center / np.linalg.norm(center))
+            probes.extend(rows[enroll:])
+            truth.extend([index] * (len(rows) - enroll))
+        templates = np.stack(templates)
+        impostors = [rng.choice(by_person[person]) for person in outsiders]
+        probe_scores = vectors[np.asarray(probes)] @ templates.T
+        impostor_scores = vectors[np.asarray(impostors)] @ templates.T
+        truth = np.asarray(truth)
+        for t in grid:
+            best, accepted = decide(probe_scores, float(t), margin)
+            _best, accepted_imp = decide(impostor_scores, float(t), margin)
+            totals[float(t)]["fnir"].append(float(np.mean(~(accepted & (best == truth)))))
+            totals[float(t)]["wrong_id"].append(float(np.mean(accepted & (best != truth))))
+            totals[float(t)]["fpir"].append(float(np.mean(accepted_imp)))
+    return {t: {key: float(np.mean(values)) for key, values in row.items()} for t, row in totals.items()}
+
+
+def choose_threshold(args, vectors, by_person, eligible, rng) -> None:
+    """Найнижчий поріг, за якого FPIR не вищий за ціль для галереї заданого розміру."""
+    grid = np.round(np.arange(0.15, 0.60001, 0.01), 2)
+    table = scan(vectors, by_person, eligible, args.choose_for, args.enroll, args.margin, args.trials, grid, rng)
+    allowed = [t for t in sorted(table) if table[t]["fpir"] <= args.fpir]
+    if not allowed:
+        raise SystemExit(f"Жоден поріг до 0.60 не дає FPIR ≤ {args.fpir} для {args.choose_for} клієнтів.")
+    chosen = allowed[0]
+    high = round(chosen + HIGH_AMOUNT_EXTRA, 2)
+    print(f"Галерея {args.choose_for}, ціль FPIR {args.fpir}: поріг {chosen:.2f}")
+    for t in sorted(table):
+        if abs(t - chosen) < 0.031 or abs(t - high) < 0.001:
+            row = table[t]
+            print(f"  поріг {t:.2f}: FPIR {row['fpir']:.4f}  FNIR {row['fnir']:.4f}  wrong_id {row['wrong_id']:.4f}")
+    destination = RESULTS_DIR / f"identification_threshold_g{args.choose_for}.json"
+    destination.write_text(
+        json.dumps({"gallery_size": args.choose_for, "fpir_target": args.fpir, "margin": args.margin, "table": {f"{t:.2f}": row for t, row in table.items()}}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Таблиця: {destination}")
+    if args.save_threshold:
+        previous = json.loads(RECOGNITION_THRESHOLD_PATH.read_text(encoding="utf-8")) if RECOGNITION_THRESHOLD_PATH.exists() else {}
+        payload = {
+            "threshold": chosen,
+            "source": "lfw-1:N",
+            "gallery_size": args.choose_for,
+            "fpir_target": args.fpir,
+            "margin": args.margin,
+            "enroll_photos": args.enroll,
+            "at_threshold": table[chosen],
+            "high_amount": {"threshold": high, **table.get(high, {})},
+            "pairs": previous.get("pairs", previous) if previous.get("source") == "lfw-1:N" else previous,
+        }
+        RECOGNITION_THRESHOLD_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Поріг {chosen:.2f} записано: {RECOGNITION_THRESHOLD_PATH}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ідентифікація 1:N на LFW")
     parser.add_argument("--cache", type=Path, default=RESULTS_DIR / "lfw_embeddings_d640.npz")
@@ -77,6 +149,9 @@ def main() -> None:
     parser.add_argument("--enroll", type=int, default=3)
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--choose-for", type=int, default=0, help="Підібрати поріг для галереї такого розміру")
+    parser.add_argument("--fpir", type=float, default=0.01, help="Ціль FPIR для --choose-for")
+    parser.add_argument("--save-threshold", action="store_true", help="Записати підібраний поріг у models/")
     args = parser.parse_args()
     if not args.cache.exists():
         raise SystemExit("Немає кешу векторів LFW. Спершу запустіть eval/recognition_metrics.py.")
@@ -88,8 +163,11 @@ def main() -> None:
     for person in np.unique(owners):
         by_person[person] = np.where(owners == person)[0]
     eligible = sorted(person for person, rows in by_person.items() if len(rows) > args.enroll)
-    threshold = load_recognition_threshold() if args.threshold is None else args.threshold
     rng = np.random.default_rng(args.seed)
+    if args.choose_for:
+        choose_threshold(args, vectors, by_person, eligible, rng)
+        return
+    threshold = load_recognition_threshold() if args.threshold is None else args.threshold
     print(f"Фото {len(vectors)}, людей {len(by_person)}, придатних для галереї {len(eligible)}. Поріг {threshold:.3f}, відрив {args.margin}.")
     report = {"threshold": threshold, "margin": args.margin, "enroll": args.enroll, "sizes": {}}
     for size in args.sizes:

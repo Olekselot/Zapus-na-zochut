@@ -1,0 +1,41 @@
+{
+  "threshold": 0.35,
+  "margin": 0.05,
+  "enroll": 3,
+  "sizes": {
+    "10": {
+      "max": {
+        "fnir": 0.0,
+        "wrong_id": 0.0,
+        "fpir": 5e-05
+      },
+      "template": {
+        "fnir": 0.0,
+        "wrong_id": 0.0,
+        "fpir": 5e-05
+      },
+      "template+margin": {
+        "fnir": 0.0,
+        "wrong_id": 0.0,
+        "fpir": 5e-05
+      }
+    },
+    "100": {
+      "max": {
+        "fnir": 0.0010230031304702763,
+        "wrong_id": 0.0,
+        "fpir": 0.0004
+      },
+      "template": {
+        "fnir": 0.0008093279167950627,
+        "wrong_id": 0.0,
+        "fpir": 0.00030000000000000003
+      },
+      "template+margin": {
+        "fnir": 0.0008093279167950627,
+        "wrong_id": 0.0,
+        "fpir": 0.00030000000000000003
+      }
+    }
+  }
+}

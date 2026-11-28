@@ -103,6 +103,15 @@ class AntispoofMetricsPathTests(unittest.TestCase):
 
             self.assertEqual(select(samples, "test", Path(folder), meta_path), [samples[1]])
 
+    def test_select_all_skips_calibration_people(self) -> None:
+        from eval.antispoof_metrics import select
+
+        with tempfile.TemporaryDirectory() as folder:
+            meta_path = Path(folder) / "meta.json"
+            meta_path.write_text('{"calibration":{"people":["p01"]}}', encoding="utf-8")
+            samples = [Sample(Path("p01.jpg"), 0, "p01"), Sample(Path("p02.jpg"), 3, "p02")]
+            self.assertEqual(select(samples, "all", Path(folder), meta_path), [samples[1]])
+
     def test_model_warm_up_reports_missing_artifacts(self) -> None:
         from src.antispoof import AntispoofModel
 

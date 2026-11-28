@@ -17,6 +17,7 @@ from src.pipeline import Pipeline
 
 FRONTAL = np.array([[70, 90], [130, 90], [100, 120], [75, 150], [125, 150]], dtype=np.float32)
 IMAGE = np.zeros((8, 8, 3), dtype=np.uint8)
+PHOTOS = [IMAGE] * 5
 
 
 def _vector(seed: int) -> np.ndarray:
@@ -170,10 +171,29 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(decision.status, "paid")
 
     def test_frames_from_different_people(self) -> None:
-        self.faces.queue = [self.client, self.client, _vector(77), self.client, self.client]
+        self.faces.queue = [self.client, _vector(76), _vector(77), _vector(78), self.client]
         decision, _preview = self._pipeline(FakeAnti(LIVE)).pay([IMAGE] * 5, 10, min_faces=3)
         self.assertEqual(decision.status, "inconsistent")
         self.assertEqual(self.bank.balance_of(1), 1000)
+
+    def test_single_outlier_frame_does_not_break_payment(self) -> None:
+        self.faces.queue = [self.client, self.client, _vector(77), self.client, self.client]
+        decision, _preview = self._pipeline(FakeAnti(LIVE)).pay([IMAGE] * 5, 10, min_faces=3)
+        self.assertEqual(decision.status, "paid")
+        self.assertEqual(decision.frames_used, 4)
+        self.assertIn("1 відкинуто", self.bank.transactions()[0]["деталі"])
+
+    def test_locked_pin_message_shows_time(self) -> None:
+        client_id, _shown = self.bank.register_person("Марко", "Коваль", [_vector(40)], 5000, pin="2468")
+        self.faces.embedding = _vector(40)
+        pipeline = self._pipeline(FakeAnti(LIVE))
+        big = HIGH_AMOUNT + 100
+        for _ in range(5):
+            decision = pipeline.pay([IMAGE], big, pin="0000")[0]
+        self.assertEqual(decision.status, "pin_locked")
+        self.assertIn("заблоковано до", decision.message)
+        self.assertEqual(pipeline.pay([IMAGE], big, pin="2468")[0].status, "pin_locked")
+        self.assertEqual(self.bank.balance_of(client_id), 5000)
 
     def test_five_frames_reject_when_majority_is_attack(self) -> None:
         rows = [[0.90, 0.05, 0.05]] * 2 + [[0.42, 0.50, 0.08]] * 3
@@ -225,59 +245,59 @@ class RegistrationTests(unittest.TestCase):
         self._dir.cleanup()
 
     def test_same_face_same_name_attaches(self) -> None:
-        decision, pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40)
+        decision, pending = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 40)
         self.assertEqual(decision.status, "enrolled")
         self.assertIsNone(pending)
         self.assertIn("Коваль Марко", decision.message)
         self.assertNotIn("c1", decision.message)
-        decision, pending = self.pipeline.start_registration("марко", "коваль", [IMAGE, IMAGE], 90)
+        decision, pending = self.pipeline.start_registration("марко", "коваль", PHOTOS, 90)
         self.assertEqual(decision.status, "ask")
         self.assertTrue(pending["can_attach"])
         self.assertFalse(pending["can_create"])
         attached = self.pipeline.confirm_existing(pending)
         self.assertEqual(attached.status, "enrolled")
         self.assertEqual(self.bank.balance_of(1), 40)
-        self.assertEqual(self.bank.accounts()[0]["векторів"], 3)
+        self.assertEqual(self.bank.accounts()[0]["векторів"], 10)
         self.assertEqual(self.pipeline.confirm_new(pending).status, "error")
 
     def test_invalid_balances_are_rejected(self) -> None:
         for balance in (float("nan"), float("inf"), -1, 0):
             with self.subTest(balance=balance):
-                decision, pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], balance)
+                decision, pending = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, balance)
                 self.assertEqual(decision.status, "error")
                 self.assertIsNone(pending)
 
         self.assertEqual(self.bank.accounts(), [])
 
     def test_stranger_cannot_take_over_account_by_name(self) -> None:
-        self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40)
+        self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 40)
         self.faces.embedding = _vector(2)
-        decision, pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 10)
+        decision, pending = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 10)
         self.assertEqual(decision.status, "ask")
         self.assertFalse(pending["can_attach"])
         self.assertTrue(pending["can_create"])
         self.assertEqual(self.pipeline.confirm_existing(pending).status, "error")
         forged = dict(pending, can_attach=True, client_id=1, display="Коваль Марко")
         self.assertEqual(self.pipeline.confirm_existing(forged).status, "error")
-        self.assertEqual(len(self.bank.client_vectors(1)), 1)
+        self.assertEqual(len(self.bank.client_vectors(1)), 5)
         created = self.pipeline.confirm_new(pending)
         self.assertEqual(created.status, "enrolled")
         self.assertNotIn("c2", created.html())
         self.faces.embedding = _vector(3)
-        blocked, again = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 10)
+        blocked, again = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 10)
         self.assertEqual(blocked.status, "blocked")
         self.assertIsNone(again)
 
     def test_same_face_other_name_is_duplicate(self) -> None:
-        self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40)
-        decision, pending = self.pipeline.start_registration("Олег", "Шевчук", [IMAGE], 40)
+        self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 40)
+        decision, pending = self.pipeline.start_registration("Олег", "Шевчук", PHOTOS, 40)
         self.assertEqual(decision.status, "duplicate")
         self.assertIsNone(pending)
         self.assertEqual(len(self.bank.accounts()), 1)
 
     def test_spoof_photos_are_not_enrolled(self) -> None:
         pipeline = Pipeline(self.bank, self.faces, FakeAnti(SCREEN))
-        decision, _pending = pipeline.start_registration("Марко", "Коваль", [IMAGE], 40)
+        decision, _pending = pipeline.start_registration("Марко", "Коваль", PHOTOS, 40)
         self.assertEqual(decision.status, "spoof")
         self.assertEqual(len(self.bank.accounts()), 0)
 
@@ -285,11 +305,21 @@ class RegistrationTests(unittest.TestCase):
         self.faces.queue = [_vector(5), _vector(6), _vector(7)]
         decision, _pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE] * 3, 40)
         self.assertEqual(decision.status, "inconsistent")
-        decision, _pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40, pin="12")
+        decision, _pending = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 40, pin="12")
         self.assertEqual(decision.status, "error")
-        decision, _pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE], 40, pin="1357")
+        decision, _pending = self.pipeline.start_registration("Марко", "Коваль", PHOTOS, 40, pin="1357")
         self.assertEqual(decision.status, "enrolled")
         self.assertTrue(self.bank.has_pin(1))
+
+    def test_too_few_usable_photos(self) -> None:
+        decision, pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE] * 4, 40)
+        self.assertEqual(decision.status, "poor_quality")
+        self.assertIn("щонайменше 5", decision.message)
+        self.assertIsNone(pending)
+        self.faces.sharp = False
+        decision, _pending = self.pipeline.start_registration("Марко", "Коваль", [IMAGE] * 8, 40)
+        self.assertEqual(decision.status, "poor_quality")
+        self.assertEqual(self.bank.accounts(), [])
 
 
 if __name__ == "__main__":

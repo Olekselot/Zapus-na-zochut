@@ -1,0 +1,52 @@
+{
+  "threshold": 0.27,
+  "source": "lfw-1:N",
+  "gallery_size": 100,
+  "fpir_target": 0.01,
+  "margin": 0.05,
+  "enroll_photos": 3,
+  "at_threshold": {
+    "fpir": 0.007850000000000001,
+    "fnir": 0.0,
+    "wrong_id": 0.0
+  },
+  "high_amount": {
+    "threshold": 0.37,
+    "fpir": 0.00030000000000000003,
+    "fnir": 0.0016171814063460725,
+    "wrong_id": 0.0
+  },
+  "pairs": {
+    "threshold": 0.2025936394929886,
+    "far_target": 0.001,
+    "source": "lfw-all-pairs",
+    "lfw_6000_at_threshold": {
+      "far": 0.0013333333333333333,
+      "frr": 0.009333333333333334,
+      "fmr": 0.0013436345314074571,
+      "fnmr": 0.0026845637583892616,
+      "fta": 0.007166666666666667
+    },
+    "extended": {
+      "halves": [
+        {
+          "threshold": 0.2035771757364273,
+          "far": 0.0009473636632439831,
+          "tar": 0.998657357679914,
+          "genuine_pairs": 3724,
+          "impostor_pairs": 7146147
+        },
+        {
+          "threshold": 0.20217706263065338,
+          "far": 0.0010571444730636944,
+          "tar": 0.9988452655889145,
+          "genuine_pairs": 4330,
+          "impostor_pairs": 7567556
+        }
+      ],
+      "far": 0.0010022540681538386,
+      "tar": 0.9987513116344142,
+      "resolvable_far": 4.198066454552362e-07
+    }
+  }
+}
