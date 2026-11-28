@@ -1,6 +1,6 @@
 # Результати
 
-Перевірено 26–28.11.2026 на CPU (i5-1245U, без GPU). Усі числа взято з реальних прогонів. Біля кожного блоку є команда, якою його відтворити.
+Перевірено 26–28.11.2026 на CPU (i5-1245U, без GPU). Усі числа взято з реальних прогонів. Біля кожного блоку є команда, якою його відтворити, і посилання на сирий звіт у папці [results/](results/).
 
 ## Дані
 
@@ -17,7 +17,7 @@ ArcFace (buffalo_l) не навчається. Перевіряється, як 
 
 ### Пари (1:1)
 
-`python eval/recognition_metrics.py`
+`python eval/recognition_metrics.py` · звіт [recognition_lfw.json](results/recognition_lfw.json), графік [recognition_lfw.png](results/recognition_lfw.png)
 
 | Метрика | Значення |
 |---|---:|
@@ -31,7 +31,7 @@ ArcFace (buffalo_l) не навчається. Перевіряється, як 
 
 ### Пошук серед N клієнтів (1:N)
 
-`python eval/identification_metrics.py`
+`python eval/identification_metrics.py --threshold 0.2026` · звіт [identification_lfw_t0.203.json](results/identification_lfw_t0.203.json)
 
 Оплата шукає обличчя серед усіх клієнтів. Тому частка «чужих», яких система прийме за когось із клієнтів (FPIR), росте приблизно як N × FAR. Нижче FPIR при порозі 0,203 (FAR 0,1 % для пар), 20 випадкових галерей, 3 фото на клієнта. FNIR і «не той рахунок» у всіх рядках дорівнюють 0.
 
@@ -41,7 +41,7 @@ ArcFace (buffalo_l) не навчається. Перевіряється, як 
 | 50 | 10,79 % | 5,67 % | 4,61 % |
 | 100 | 20,28 % | 11,48 % | 7,62 % |
 
-Поріг демо обрано за правилом «найнижчий поріг, за якого FPIR ≤ 1 % при 100 клієнтах». Команда: `python eval/identification_metrics.py --choose-for 100 --fpir 0.01 --save-threshold`.
+Поріг демо обрано за правилом «найнижчий поріг, за якого FPIR ≤ 1 % при 100 клієнтах». Команда: `python eval/identification_metrics.py --choose-for 100 --fpir 0.01 --save-threshold`. Уся сітка порогів 0,15–0,60: [identification_threshold_g100.json](results/identification_threshold_g100.json); окремі прогони для 10 і 100 клієнтів: [0,26](results/identification_lfw_t0.26.json), [0,30](results/identification_lfw_t0.30.json), [0,35](results/identification_lfw_t0.35.json), [0,40](results/identification_lfw_t0.40.json).
 
 | Поріг | FPIR | FNIR |
 |---:|---:|---:|
@@ -82,7 +82,7 @@ ArcFace (buffalo_l) не навчається. Перевіряється, як 
 
 На окремому test-спліті CelebA-Spoof APCER виявився 24,68 % (повний test тіммейта, 2149 кадрів) і 30,24 % (наша звітна половина).
 
-Виправлення: `python training/calibrate_antispoof.py --data data/celeba_spoof_test --write`. Test ділиться навпіл. На першій половині (204 живих, 623 атаки) підбираються температура й поріг. Звіт — лише на другій половині (215 живих, 615 атак). `eval/antispoof_metrics.py` далі ці фото калібрування пропускає.
+Виправлення: `python training/calibrate_antispoof.py --data data/celeba_spoof_test --write`. Test ділиться навпіл. На першій половині (204 живих, 623 атаки) підбираються температура й поріг. Звіт — лише на другій половині (215 живих, 615 атак). `eval/antispoof_metrics.py` далі ці фото калібрування пропускає. Звіти: [обране правило BPCER ≤ 5 %](results/antispoof_calibration_bpcer.json), [правило APCER ≤ 5 %](results/antispoof_calibration_apcer.json).
 
 | Як обрано поріг | Поріг | T | APCER | BPCER | ACER |
 |---|---:|---:|---:|---:|---:|
@@ -108,6 +108,8 @@ python training/calibrate_antispoof.py --data data/celeba_spoof_test --weights m
 | З нуля | 4 000 | 2 з 8 | 1042 с | 95,45 % | 3,26 % | 95,35 % |
 | ImageNet | 4 000 | 8 з 8 | 944 с | 13,66 % | 4,65 % | 9,30 % |
 | ImageNet, основна | 15 718 | 8 з 8 | 3546 с | 8,46 % | 8,37 % | 4,19 % |
+
+Звіти: [з нуля](results/ablation_scratch.json), [ImageNet](results/ablation_imagenet.json); криві навчання: [з нуля](results/ablation_scratch_training.png), [ImageNet](results/ablation_imagenet_training.png).
 
 Модель з нуля за той самий бюджет не узагальнює. На навчальних фото її точність доходить до 88 %, а на validation вона весь час лишається на рівні 48–52 %, тобто відповідає одним класом. Попереднє навчання на ImageNet дає працездатну модель уже на 4000 фото, а більше даних далі покращує результат.
 

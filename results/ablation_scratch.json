@@ -1,0 +1,48 @@
+{
+  "data": [
+    "data/celeba_spoof_test"
+  ],
+  "weights": "models/ablation/scratch.pt",
+  "seed": 42,
+  "holdout": 0.5,
+  "rule": "bpcer",
+  "target": 0.05,
+  "frames": {
+    "calibration": 827,
+    "report": 830,
+    "no_face": 165
+  },
+  "temperature": {
+    "old": 0.7234199643135071,
+    "new": 20.0
+  },
+  "report_old": {
+    "threshold": 0.3996,
+    "apcer": 0.3008130081300813,
+    "bpcer": 0.6976744186046512,
+    "acer": 0.4992437133673663,
+    "live": 215,
+    "attacks": 615
+  },
+  "report_new": {
+    "threshold": 0.3356,
+    "apcer": 0.9544715447154472,
+    "bpcer": 0.03255813953488372,
+    "acer": 0.49351484212516544,
+    "live": 215,
+    "attacks": 615
+  },
+  "report_bpcer_at_apcer": {
+    "0.01": 0.9720930232558139,
+    "0.05": 0.9627906976744186,
+    "0.1": 0.9534883720930233
+  },
+  "calibration": {
+    "threshold": 0.3356,
+    "apcer": 0.9743178170144462,
+    "bpcer": 0.0196078431372549,
+    "acer": 0.49696283007585057,
+    "live": 204,
+    "attacks": 623
+  }
+}

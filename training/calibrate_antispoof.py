@@ -49,6 +49,14 @@ def logits_for(model: AntispoofModel, items, batch_size: int):
     return torch.cat(chunks), labels
 
 
+def _relative(path: Path) -> str:
+    """Шлях від кореня проєкту, щоб у звіті не було локальних абсолютних шляхів."""
+    try:
+        return Path(path).resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
 def rates_at(probs: np.ndarray, labels: np.ndarray, threshold: float) -> dict:
     rates = presentation_rates(labels, live_mask_from_probs(probs, threshold))
     return {
@@ -105,8 +113,8 @@ def main() -> None:
 
     labels = report_labels.numpy()
     result = {
-        "data": [str(path) for path in args.data],
-        "weights": str(args.weights),
+        "data": [_relative(path) for path in args.data],
+        "weights": _relative(args.weights),
         "seed": args.seed,
         "holdout": args.holdout,
         "rule": args.rule,
